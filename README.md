@@ -8,6 +8,12 @@ erio is a framework designed for the **invariance of session connection state** 
 
 It implements the Reactor pattern with Linux epoll for I/O multiplexing and runs in an event-driven manner without creating a goroutine per connection.
 
+erio is a good fit for the following use cases:
+
+* When you need to maintain sessions and want to modify a session's data from within that session without locks (e.g., sync.Mutex).
+* When you need independent per-session timers (e.g., idle connection detection, authentication timeouts) without locks or complex code.
+* When you need safe asynchronous event delivery from external goroutines to the session-processing goroutine (via PostUserEvent).
+
 ## 2. Requirements
 
 - **Linux**: Uses epoll and eventfd.
