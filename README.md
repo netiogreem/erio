@@ -22,7 +22,7 @@ erio is a good fit for the following use cases:
 
 ## 3. Key Features
 
-* **Session event serialization**
+* **Serialized processing of session events**
   * Connection, receive, write/write-completion, multi-timer, and close events are processed serially on the same Reactor goroutine, so event callbacks of the same session never run concurrently.
 * **Multiple listen addresses and connection distribution**
   * You can register multiple addresses and ports, and assign accepted connections to multiple Reactors in round-robin order.
@@ -438,7 +438,7 @@ type ClientHandler interface {
 
 * Must be embedded in a ClientHandler.
 * HandlerContext is the type that controls a ClientHandler, and its methods, except Init() and Reset(), are thread-safe and can also be used from other goroutines.
-* Calls to HandlerContext's command methods (Write, SetTimeout, UnsetTimeout, Close, PostUserEvent) are asynchronous requests to the TCPReactor for event serialization; the TCPReactor processes them and calls the corresponding ClientHandler functions.
+* Calls to HandlerContext's command methods (Write, SetTimeout, UnsetTimeout, Close, PostUserEvent) are asynchronous requests to the TCPReactor for serialized event processing; the TCPReactor processes them and calls the corresponding ClientHandler functions.
 
 ```Go
 // Creates a HandlerContext for a client TCP connection.
