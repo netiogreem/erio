@@ -4,7 +4,7 @@ Epoll Reactor-based TCP I/O framework
 
 ## 1. Introduction
 
-erio is a framework designed for the **invariance of session connection state** and the  **serialization of session events**, **guaranteeing** that each session is always processed on the  **same goroutine** .
+erio is a framework designed for the **invariance of session connection state** and the  **serialization of session events**, **guaranteeing** that each session is always processed on the  **same goroutine**.
 
 It implements the Reactor pattern with Linux epoll for I/O multiplexing and runs in an event-driven manner without creating a goroutine per connection.
 
