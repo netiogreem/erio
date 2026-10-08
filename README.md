@@ -43,28 +43,28 @@ After receiving data from a client, the test server sends an 8-byte acknowledgme
 
 Both erio and gnet use their public APIs to send one response per received packet (one 'Write()' call per received packet).
 
-* AMD Ryzen 7 8845HS (16 logical cores), boost disabled, CPU clock 2.6GHz to 3.0GHz
-* 4 cores (1 Acceptor, 3 Reactors) / Clients: 12 separate processes
+* AMD Ryzen 7945HX (32 logical cores), CPU clock 2.85GHz to 3.7GHz
+* 6 cores (1 Acceptor, 5 Reactors) / Clients: 25 separate processes
 
 ### erio
 
-|   Client message size | Pipelined requests per client |       **TPS** | Avg TPS per Reactor | Receive throughput | Messages processed | Elapsed time |     CPU usage / RSS |
-| --------------------: | ----------------------------: | ------------------: | ------------------: | -----------------: | -----------------: | -----------: | ------------------: |
-|             300 bytes |                           100 | **1,023,329** |   **341,110** |        307.00 MB/s |         30,703,026 |     30.003 s | 295.9% / 12.80 MiB |
-|             300 bytes |                            10 |   **808,168** |   **269,389** |        242.45 MB/s |         24,245,975 |     30.001 s | 299.3% / 13.21 MiB |
-|             300 bytes |                             1 |   **225,940** |    **75,313** |         67.78 MB/s |          6,778,574 |     30.002 s | 301.1% / 12.63 MiB |
-| **1,000 bytes** |                 **100** | **1,001,122** |   **333,707** |      1,001.12 MB/s |         30,036,864 |     30.003 s | 297.4% / 13.23 MiB |
-|           1,000 bytes |                            10 |   **776,648** |   **258,883** |        776.65 MB/s |         23,300,917 |     30.002 s | 299.7% / 12.23 MiB |
-| **1,000 bytes** |                   **1** |   **225,477** |    **75,159** |        225.48 MB/s |          6,764,347 |     30.000 s |  301.0% / 12.34 MiB |
+| Client<br />message <br />size | Pipelined<br />requests<br /> per client |       **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |    CPU usage / RSS |
+| -----------------------------: | ---------------------------------------: | ------------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
+|                      300 bytes |                                      100 | **1,980,159** |         **396,032** |              594.05 MB/s |               59,409,288 |           30.002 s | 499.9% / 14.27 MiB |
+|                      300 bytes |                                       10 | **1,129,571** |         **225,914** |              338.87 MB/s |               33,889,523 |           30.002 s | 501.7% / 14.04 MiB |
+|                      300 bytes |                                        1 |   **313,880** |          **62,776** |               94.16 MB/s |                9,416,825 |           30.001 s | 501.7% / 14.10 MiB |
+|                    1,000 bytes |                                      100 | **1,959,974** |         **391,995** |            1,959.97 MB/s |               58,800,927 |           30.001 s | 499.9% / 15.25 MiB |
+|                    1,000 bytes |                                       10 | **1,120,103** |         **224,021** |            1,120.10 MB/s |               33,603,945 |           30.001 s | 501.8% / 13.92 MiB |
+|                    1,000 bytes |                                        1 |   **313,613** |          **62,723** |              313.61 MB/s |                9,408,830 |           30.001 s | 501.8% / 13.14 MiB |
 
 > Send, receive, and response-check counts all matched, with 0 errors. CPU usage counts one logical CPU as 100%.
 
 ### gnet v2.10.0
 
-|    Client message size | Pipelined requests per client |     **TPS** | Avg TPS per Reactor | Receive throughput | Messages processed | Elapsed time |    CPU usage / RSS |
-| ---------------------: | ----------------------------: | ----------------: | ------------------: | -----------------: | -----------------: | -----------: | -----------------: |
-|  **1,000 bytes** |                 **100** | **313,358** |   **104,453** |        313.36 MB/s |          9,402,035 |     30.004 s | 300.4% / 11.37 MiB |
-| **1,000 bytes** |                   **1** | **221,966** |    **73,989** |        221.97 MB/s |          6,659,063 |     30.000 s | 300.4% / 12.72 MiB |
+| Client<br />message <br />size | Pipelined<br /> requests<br /> per client |     **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |    CPU usage / RSS |
+| -----------------------------: | ----------------------------------------: | ----------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
+|                    1,000 bytes |                                       100 | **530,792** |         **106,158** |              530.79 MB/s |               15,926,220 |           30.005 s | 502.5% / 11.50 MiB |
+|                    1,000 bytes |                                         1 | **311,798** |          **62,360** |              311.80 MB/s |                9,354,398 |           30.001 s | 503.4% / 14.56 MiB |
 
 ## 5. Quick Start
 
