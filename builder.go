@@ -37,20 +37,20 @@ type ReactorParam struct {
 	ErrorCallback        func(error) // Reactor error callback; nil disables notifications.
 }
 
-// builder stores the TCPServer configuration and creates TCPReactor, Acceptor, Acceptors, and TCPServer instances during Build.
-type builder struct {
+// Builder stores the TCPServer configuration and creates TCPReactor, Acceptor, Acceptors, and TCPServer instances during Build.
+type Builder struct {
 	reactorParam        ReactorParam         // Reactor settings specified by WithReactor.
 	listenAddresses     []string             // Listening addresses collected in the order of WithListenAddress calls.
 	acceptErrorCallback func(error)          // Acceptor error callback.
 	factory             ClientHandlerFactory // Function that creates a ClientHandler for each accepted connection.
 }
 
-// Builder creates a builder with an empty configuration.
+// NewBuilder creates a Builder with an empty configuration.
 // Listening addresses and ClientHandlerFactory should be set separately.
 //
-// Returns the created builder.
-func Builder() *builder {
-	return &builder{
+// Returns the created Builder.
+func NewBuilder() *Builder {
+	return &Builder{
 		reactorParam:        ReactorParam{},
 		listenAddresses:     nil,
 		acceptErrorCallback: nil,
@@ -64,8 +64,8 @@ func Builder() *builder {
 //
 //   - param: Reactor settings
 //
-// Returns the builder itself for method chaining.
-func (this *builder) WithReactor(param ReactorParam) *builder {
+// Returns the Builder itself for method chaining.
+func (this *Builder) WithReactor(param ReactorParam) *Builder {
 	this.reactorParam = param
 	return this
 }
@@ -76,8 +76,8 @@ func (this *builder) WithReactor(param ReactorParam) *builder {
 //
 //   - listenAddress: Listening address in "IP:port" format; if the port is 0, a port is assigned automatically during Start
 //
-// Returns the builder itself for method chaining.
-func (this *builder) WithListenAddress(listenAddress string) *builder {
+// Returns the Builder itself for method chaining.
+func (this *Builder) WithListenAddress(listenAddress string) *Builder {
 	this.listenAddresses = append(this.listenAddresses, listenAddress)
 	return this
 }
@@ -88,8 +88,8 @@ func (this *builder) WithListenAddress(listenAddress string) *builder {
 //
 //   - acceptErrorCallback: Error callback; nil disables notifications
 //
-// Returns the builder itself for method chaining.
-func (this *builder) WithAcceptErrorCallback(acceptErrorCallback func(error)) *builder {
+// Returns the Builder itself for method chaining.
+func (this *Builder) WithAcceptErrorCallback(acceptErrorCallback func(error)) *Builder {
 	this.acceptErrorCallback = acceptErrorCallback
 	return this
 }
@@ -98,8 +98,8 @@ func (this *builder) WithAcceptErrorCallback(acceptErrorCallback func(error)) *b
 //
 //   - factory: Function that creates a ClientHandler
 //
-// Returns the builder itself for method chaining.
-func (this *builder) WithClientHandlerFactory(factory ClientHandlerFactory) *builder {
+// Returns the Builder itself for method chaining.
+func (this *Builder) WithClientHandlerFactory(factory ClientHandlerFactory) *Builder {
 	this.factory = factory
 	return this
 }
@@ -111,7 +111,7 @@ func (this *builder) WithClientHandlerFactory(factory ClientHandlerFactory) *bui
 //
 // Returns a TCPServer in the Init state on success, or an error on failure.
 // Returns ErrAcceptorsEmpty if there are no listening addresses, or ErrAcceptorNilFactory if factory is nil.
-func (this *builder) Build() (server *TCPServer, err error) {
+func (this *Builder) Build() (server *TCPServer, err error) {
 	param, err := this.validateParam()
 	if err != nil {
 		return nil, err
@@ -149,7 +149,7 @@ func (this *builder) Build() (server *TCPServer, err error) {
 // If EventBatchSize, RegisterCommandQuota, CommandReserveSize, or ReadBufferSize is 0, it returns an empty ReactorParam
 // and the corresponding error: ErrBuilderInvalidEventBatchSize, ErrBuilderInvalidRegisterCommandQuota,
 // ErrBuilderInvalidCommandReserveSize, or ErrBuilderInvalidReadBufferSize.
-func (this *builder) validateParam() (ReactorParam, error) {
+func (this *Builder) validateParam() (ReactorParam, error) {
 	param := this.reactorParam
 	if param.Count == 0 {
 		if param.Count = uint32(max(runtime.GOMAXPROCS(0)-1, 1)); param.Count == 0 {
@@ -182,7 +182,7 @@ func (this *builder) validateParam() (ReactorParam, error) {
 //   - param: Validated Reactor settings
 //
 // Returns the list of created Reactors and, if creation fails, the creation and cleanup errors.
-func (this *builder) buildReactors(param ReactorParam) (retReactors []*TCPReactor, err error) {
+func (this *Builder) buildReactors(param ReactorParam) (retReactors []*TCPReactor, err error) {
 	reactors := make([]*TCPReactor, 0)
 
 	defer func() {
@@ -223,7 +223,7 @@ func (this *builder) buildReactors(param ReactorParam) (retReactors []*TCPReacto
 //   - reactors: List of Reactors to assign connections to
 //
 // Returns the created Acceptors, or an address error, factory error, or Acceptors creation error.
-func (this *builder) buildAcceptors(reactors []*TCPReactor) (*Acceptors, error) {
+func (this *Builder) buildAcceptors(reactors []*TCPReactor) (*Acceptors, error) {
 	nextReactor := atomic.Uint32{}
 	nextReactor.Store(0)
 	acceptedCallback := func(handler ClientHandler) error {

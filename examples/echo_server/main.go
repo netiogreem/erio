@@ -101,7 +101,7 @@ func main() {
 	reactorError := func(err error) { log.Print(err) }
 	acceptError := func(err error) { log.Print(err) }
 
-	server, err := erio.Builder().
+	server, err := erio.NewBuilder().
 		WithReactor(erio.ReactorParam{Count: 3,
 			EventBatchSize:       128,
 			RegisterCommandQuota: 1024,

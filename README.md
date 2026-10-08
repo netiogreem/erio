@@ -188,7 +188,7 @@ func main() {
 	reactorError := func(err error) { log.Print(err) }
 	acceptError := func(err error) { log.Print(err) }
 
-	server, err := erio.Builder().
+	server, err := erio.NewBuilder().
 		WithReactor(erio.ReactorParam{Count: 3,
 			EventBatchSize:       128,
 			RegisterCommandQuota: 1024,
@@ -302,22 +302,22 @@ type ReactorParam struct {
 }
 
 // Creates a Builder with an empty configuration.
-func Builder() *builder
+func NewBuilder() *Builder
 
 // Sets the number of Reactors, the per-Reactor event batch size, command queue capacity, and read buffer size, and the error callback.
-func (this *builder) WithReactor(param ReactorParam) *builder
+func (this *Builder) WithReactor(param ReactorParam) *Builder
 
 // Adds a listen address. If the port is 0, it is assigned automatically at start.
-func (this *builder) WithListenAddress(listenAddress string) *builder
+func (this *Builder) WithListenAddress(listenAddress string) *Builder
 
 // Sets the error callback for accepting connections, creating Handlers, and requesting Reactor registration.
-func (this *builder) WithAcceptErrorCallback(acceptErrorCallback func(error)) *builder
+func (this *Builder) WithAcceptErrorCallback(acceptErrorCallback func(error)) *Builder
 
 // Sets the Factory that creates a ClientHandler for each accepted connection.
-func (this *builder) WithClientHandlerFactory(factory ClientHandlerFactory) *builder
+func (this *Builder) WithClientHandlerFactory(factory ClientHandlerFactory) *Builder
 
 // Creates a TCPServer from the configured Acceptors and Reactors.
-func (this *builder) Build() (server *TCPServer, err error)
+func (this *Builder) Build() (server *TCPServer, err error)
 ```
 
 ### TCPServer

@@ -190,7 +190,7 @@ func main() {
 	reactorError := func(err error) { log.Print(err) }
 	acceptError := func(err error) { log.Print(err) }
 
-	server, err := erio.Builder().
+	server, err := erio.NewBuilder().
 		WithReactor(erio.ReactorParam{Count: 3,
 			EventBatchSize:       128,
 			RegisterCommandQuota: 1024,
@@ -302,22 +302,22 @@ type ReactorParam struct {
 }
 
 // 빈 설정으로 Builder를 생성합니다.
-func Builder() *builder
+func NewBuilder() *Builder
 
 // Reactor 수, Reactor별 이벤트 배치 크기, 명령 대기열 용량, 수신 버퍼 크기와 오류 콜백을 설정합니다.
-func (this *builder) WithReactor(param ReactorParam) *builder
+func (this *Builder) WithReactor(param ReactorParam) *Builder
 
 // 리스닝 주소를 추가합니다. 포트가 0이면 시작 시 자동 할당됩니다.
-func (this *builder) WithListenAddress(listenAddress string) *builder
+func (this *Builder) WithListenAddress(listenAddress string) *Builder
 
 // 연결 수락·Handler 생성·Reactor 등록 요청 과정의 오류 콜백을 설정합니다.
-func (this *builder) WithAcceptErrorCallback(acceptErrorCallback func(error)) *builder
+func (this *Builder) WithAcceptErrorCallback(acceptErrorCallback func(error)) *Builder
 
 // 수락한 연결마다 ClientHandler를 생성할 Factory를 설정합니다.
-func (this *builder) WithClientHandlerFactory(factory ClientHandlerFactory) *builder
+func (this *Builder) WithClientHandlerFactory(factory ClientHandlerFactory) *Builder
 
 // 설정한 Acceptors와 Reactor들로 TCPServer를 생성합니다.
-func (this *builder) Build() (server *TCPServer, err error)
+func (this *Builder) Build() (server *TCPServer, err error)
 ```
 
 ### TCPServer
