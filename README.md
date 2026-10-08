@@ -4,7 +4,7 @@ Epoll Reactor-based TCP I/O framework
 
 ## 1. Introduction
 
-erio is a framework designed for the **invariance of session connection state** and the  **serialized processing of session events**, **guaranteeing** that each session is always processed on the  **same goroutine**.
+erio is a framework designed for the **invariance of session connection state** and the **serialized processing of session events, guaranteeing** that each session is always processed on the same goroutine.
 
 It implements the Reactor pattern with Linux epoll for I/O multiplexing and runs in an event-driven manner without creating a goroutine per connection.
 
@@ -43,12 +43,12 @@ After receiving data from a client, the test server sends an 8-byte acknowledgme
 
 Both erio and gnet use their public APIs to send one response per received packet (one 'Write()' call per received packet).
 
-* AMD Ryzen 7945HX (32 logical cores), CPU clock 2.85GHz to 3.7GHz
+* AMD Ryzen™ 9 7945HX (32 logical cores), CPU clock 2.85GHz to 3.7GHz
 * 6 cores (1 Acceptor, 5 Reactors) / Clients: 25 separate processes
 
 ### erio
 
-| Client<br />message <br />size | Pipelined<br />requests<br /> per client |       **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |    CPU usage / RSS |
+| Client<br />message <br />size | Pipelined<br />requests<br /> per client |       **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |         CPU / RSS |
 | -----------------------------: | ---------------------------------------: | ------------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
 |                      300 bytes |                                      100 | **1,980,159** |         **396,032** |              594.05 MB/s |               59,409,288 |           30.002 s | 499.9% / 14.27 MiB |
 |                      300 bytes |                                       10 | **1,129,571** |         **225,914** |              338.87 MB/s |               33,889,523 |           30.002 s | 501.7% / 14.04 MiB |
@@ -61,7 +61,7 @@ Both erio and gnet use their public APIs to send one response per received packe
 
 ### gnet v2.10.0
 
-| Client<br />message <br />size | Pipelined<br /> requests<br /> per client |     **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |    CPU usage / RSS |
+| Client<br />message <br />size | Pipelined<br /> requests<br /> per client |     **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |         CPU / RSS |
 | -----------------------------: | ----------------------------------------: | ----------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
 |                    1,000 bytes |                                       100 | **530,792** |         **106,158** |              530.79 MB/s |               15,926,220 |           30.005 s | 502.5% / 11.50 MiB |
 |                    1,000 bytes |                                         1 | **311,798** |          **62,360** |              311.80 MB/s |                9,354,398 |           30.001 s | 503.4% / 14.56 MiB |

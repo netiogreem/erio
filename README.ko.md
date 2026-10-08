@@ -45,12 +45,12 @@ erio는 다음과 같은 경우에 적합합니다.
 
 erio와 gnet 모두 공개 API를 사용하며 수신된 패킷별로 하나의 응답을 전송합니다(수신된 패킷당 'Write()' 호출 1회, Pipeline이 100인 경우 100개의 패킷, 100번 응답).
 
-* AMD Ryzen 7945HX (32 logical cores), CPU clock 2.85GHz to 3.7GHz
+* AMD Ryzen™ 9 7945HX (32 logical cores), CPU clock 2.85GHz to 3.7GHz
 * 6 cores (1 Acceptor, 5 Reactors) / Clients: 25 separate processes
 
 ### erio
 
-| Client<br />message <br />size | Pipelined<br />requests<br /> per client |       **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |    CPU usage / RSS |
+| Client<br />message <br />size | Pipelined<br />requests<br /> per client |       **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |         CPU / RSS |
 | -----------------------------: | ---------------------------------------: | ------------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
 |                      300 bytes |                                      100 | **1,980,159** |         **396,032** |              594.05 MB/s |               59,409,288 |           30.002 s | 499.9% / 14.27 MiB |
 |                      300 bytes |                                       10 | **1,129,571** |         **225,914** |              338.87 MB/s |               33,889,523 |           30.002 s | 501.7% / 14.04 MiB |
@@ -63,7 +63,7 @@ erio와 gnet 모두 공개 API를 사용하며 수신된 패킷별로 하나의 
 
 ### gnet v2.10.0
 
-| Client<br />message <br />size | Pipelined<br /> requests<br /> per client |     **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |    CPU usage / RSS |
+| Client<br />message <br />size | Pipelined<br /> requests<br /> per client |     **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |         CPU / RSS |
 | -----------------------------: | ----------------------------------------: | ----------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
 |                    1,000 bytes |                                       100 | **530,792** |         **106,158** |              530.79 MB/s |               15,926,220 |           30.005 s | 502.5% / 11.50 MiB |
 |                    1,000 bytes |                                         1 | **311,798** |          **62,360** |              311.80 MB/s |                9,354,398 |           30.001 s | 503.4% / 14.56 MiB |
