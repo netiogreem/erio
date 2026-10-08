@@ -2,7 +2,7 @@
 
 Epoll Reactor-based TCP I/O framework
 
-## 1. Introduction
+## Introduction
 
 erio is a framework designed for the **invariance of session connection state** and the **serialized processing of session events, guaranteeing** that each session is always processed on the same goroutine.
 
@@ -14,13 +14,13 @@ erio is a good fit for the following use cases:
 * When you need independent per-session timers (e.g., idle connection detection, authentication timeouts) without locks or complex code.
 * When you need safe asynchronous event delivery from external goroutines to the session-processing goroutine (via PostUserEvent).
 
-## 2. Requirements
+## Requirements
 
 - **Linux**: Uses epoll and eventfd.
 - **Go 1.26.0 or later**: The version currently specified in go.mod.
 - **External dependency**: Uses github.com/emirpasic/gods v1.18.1 for timer management, managed as a Go module.
 
-## 3. Key Features
+## Key Features
 
 * **Serialized processing of session events**
   * Connection, receive, write/write-completion, multi-timer, and close events are processed serially on the same Reactor goroutine, so event callbacks of the same session never run concurrently.
@@ -37,7 +37,7 @@ erio is a good fit for the following use cases:
 * **Asynchronous delivery of user data to a target session**
   * User-defined data can be sent asynchronously from another goroutine to any session and received in that session on the goroutine the session runs on.
 
-## 4. Performance
+## Performance
 
 After receiving data from a client, the test server sends an 8-byte acknowledgment for each packet.
 
@@ -66,7 +66,7 @@ Both erio and gnet use their public APIs to send one response per received packe
 |                    1,000 bytes |                                       100 | **530,792** |         **106,158** |              530.79 MB/s |               15,926,220 |           30.005 s | 502.5% / 11.50 MiB |
 |                    1,000 bytes |                                         1 | **311,798** |          **62,360** |              311.80 MB/s |                9,354,398 |           30.001 s | 503.4% / 14.56 MiB |
 
-## 5. Quick Start
+## Quick Start
 
 erio **avoids implementation approaches that depend only on callbacks, such as the On{Event}(**onComplete func(...)**) pattern**.
 
@@ -266,7 +266,7 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
 
 ---
 
-## 6. API
+## API
 
 ### Builder
 
@@ -517,7 +517,7 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
 
 ---
 
-## 7. Caveats
+## Caveats
 
 * **Do not block for long in event callbacks.**
   * ClientHandler sessions assigned to the same Reactor are processed on a single goroutine. Long computations, synchronous DB queries, time.Sleep, or infinite retries inside a callback delay the processing of other sessions on that Reactor. Long transactions must be designed separately.
