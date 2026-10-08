@@ -21,6 +21,7 @@ const (
 	ErrBuilderInvalidEventBatchSize       TCPServerBuilderError = "erio: tcp reactor event batch size must be positive"
 	ErrBuilderInvalidRegisterCommandQuota TCPServerBuilderError = "erio: tcp reactor command quota must be positive"
 	ErrBuilderInvalidCommandReserveSize   TCPServerBuilderError = "erio: tcp reactor command reserve size must be positive"
+	ErrBuilderInvalidReadBufferSize       TCPServerBuilderError = "erio: tcp reactor read buffer size must be positive"
 )
 
 // ReactorParam holds the settings for the TCPReactors that Builder will create.
@@ -32,6 +33,7 @@ type ReactorParam struct {
 	EventBatchSize       uint32      // Maximum number of events received per epoll wait for each Reactor.
 	CommandReserveSize   uint32      // Preallocates memory for each Reactor's command array. Double buffering uses twice the reserved size to minimize locking.
 	RegisterCommandQuota uint32      // The maximum number of RegisterHandler commands each Reactor can accept at a time. Capacity becomes available again as commands are processed internally.
+	ReadBufferSize       uint32      // Size in bytes of the receive buffer of each Reactor.
 	ErrorCallback        func(error) // Reactor error callback; nil disables notifications.
 }
 
@@ -144,9 +146,9 @@ func (this *builder) Build() (server *TCPServer, err error) {
 // If Count is 0, it sets Count to GOMAXPROCS-1 (at least 1).
 // It does not modify the stored reactorParam.
 //
-// If EventBatchSize, RegisterCommandQuota, or CommandReserveSize is 0, it returns an empty ReactorParam
+// If EventBatchSize, RegisterCommandQuota, CommandReserveSize, or ReadBufferSize is 0, it returns an empty ReactorParam
 // and the corresponding error: ErrBuilderInvalidEventBatchSize, ErrBuilderInvalidRegisterCommandQuota,
-// or ErrBuilderInvalidCommandReserveSize.
+// ErrBuilderInvalidCommandReserveSize, or ErrBuilderInvalidReadBufferSize.
 func (this *builder) validateParam() (ReactorParam, error) {
 	param := this.reactorParam
 	if param.Count == 0 {
@@ -165,6 +167,10 @@ func (this *builder) validateParam() (ReactorParam, error) {
 
 	if param.CommandReserveSize == 0 {
 		return ReactorParam{}, ErrBuilderInvalidCommandReserveSize
+	}
+
+	if param.ReadBufferSize == 0 {
+		return ReactorParam{}, ErrBuilderInvalidReadBufferSize
 	}
 
 	return param, nil
@@ -196,6 +202,7 @@ func (this *builder) buildReactors(param ReactorParam) (retReactors []*TCPReacto
 			param.EventBatchSize,
 			param.CommandReserveSize,
 			param.RegisterCommandQuota,
+			param.ReadBufferSize,
 			param.ErrorCallback,
 		)
 

@@ -13,7 +13,7 @@ import (
 
 func newTCPServerTestReactor(test testing.TB) *erio.TCPReactor {
 	test.Helper()
-	reactor, createError := erio.NewTCPReactor(8, 8, 8, func(reactorError error) {
+	reactor, createError := erio.NewTCPReactor(8, 8, 8, 64, func(reactorError error) {
 		test.Errorf("reactor error=%v", reactorError)
 	})
 	if createError != nil {
@@ -29,7 +29,7 @@ func newTCPServerTest(test testing.TB, listenAddresses ...string) (*erio.TCPServ
 	test.Helper()
 	events := &handlerContextFixture{events: make(chan handlerContextTestEvent, 16)}
 	factory := func(fd erio.FileDescriptor, listenAddress netip.AddrPort) (erio.ClientHandler, error) {
-		context, createError := erio.NewHandlerContext(fd, listenAddress, 64, 64, 8, 0)
+		context, createError := erio.NewHandlerContext(fd, listenAddress, 64, 8, 0)
 		if createError != nil {
 			return nil, createError
 		}

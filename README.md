@@ -4,7 +4,7 @@ Epoll Reactor-based TCP I/O framework
 
 ## 1. Introduction
 
-erio is a framework designed for the **invariance of session connection state** and the  **serialization of session events**, **guaranteeing** that each session is always processed on the  **same goroutine**.
+erio is a framework designed for the **invariance of session connection state** and the  **serialized processing of session events**, **guaranteeing** that each session is always processed on the  **same goroutine**.
 
 It implements the Reactor pattern with Linux epoll for I/O multiplexing and runs in an event-driven manner without creating a goroutine per connection.
 
@@ -35,7 +35,7 @@ erio is a good fit for the following use cases:
 * **Session control from other goroutines**
   * HandlerContext's Write, SetTimeout, UnsetTimeout, Close, and PostUserEvent can be called from other goroutines without any extra work (such as synchronization).
 * **Asynchronous delivery of user data to a target session**
-  * From another goroutine, you can asynchronously deliver user-defined data to a target session and receive it on that session's Reactor goroutine.
+  * User-defined data can be sent asynchronously from another goroutine to any session and received in that session on the goroutine the session runs on.
 
 ## 4. Performance
 
@@ -97,7 +97,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/netiogreeme/erio"
+	"github.com/netiogreem/erio"
 )
 
 // Alias for HandlerContext.
@@ -118,9 +118,9 @@ const ALIVE_TIMER_KEY uint64 = 10
 // Called each time the Acceptor accepts a connection.
 // See: client_handler.go::ClientHandlerFactory
 func EchoHandlerFactory(fd erio.FileDescriptor, listenAddr netip.AddrPort) (erio.ClientHandler, error) {
-	// Receive buffer 32KiB, send buffer 64KiB, command quota 64, SO_LINGER 5 seconds.
+	// Send buffer 64KiB, command quota 64, SO_LINGER 5 seconds.
 	// See: handler_context.go::NewHandlerContext
-	handler, err := erio.NewHandlerContext(fd, listenAddr, 32*1024, 65536, 64, 5)
+	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64, 5)
 	if err != nil {
 		return nil, err
 	}
@@ -193,6 +193,7 @@ func main() {
 			EventBatchSize:       128,
 			RegisterCommandQuota: 1024,
 			CommandReserveSize:   4096,
+			ReadBufferSize:       32 * 1024, // Receive buffer of each Reactor.
 			ErrorCallback:        reactorError}).
 		// Accepts connections on two addresses.
 		WithListenAddress("127.0.0.1:2000").
@@ -272,13 +273,14 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
 * Builder is implemented as a fluent interface, so you can configure the server by chaining method calls.
   * If the configuration is valid, you get a TCPServer.
 * WithReactor
-  * Sets the number of Reactors, the per-Reactor event batch size and command queue capacity, and the error callback.
+  * Sets the number of Reactors, the per-Reactor event batch size, command queue capacity, and read buffer size, and the error callback.
   * A Reactor is an instance that processes Epoll events; due to the nature of syscall.Epoll, it occupies one thread.
   * ReactorParam
     * Count: The number of Reactors.
     * EventBatchSize: The maximum number of events received per epoll wait.
     * RegisterCommandQuota: The maximum number of RegisterHandler commands each Reactor can accept at a time.
     * CommandReserveSize: The reserved size of the command queue.
+    * ReadBufferSize: The receive buffer size of each Reactor.
     * ErrorCallback: Reactor error callback
 * WithListenAddress(listenAddress string)
   * Registers a listen address. (e.g., 172.30.10.10:30010)
@@ -295,13 +297,14 @@ type ReactorParam struct {
 	EventBatchSize       uint32      // Maximum number of events received per epoll wait
 	RegisterCommandQuota uint32      // Register command queue limit
 	CommandReserveSize   uint32      // Reserved size of the command queue
+	ReadBufferSize       uint32      // Receive buffer size of each Reactor
 	ErrorCallback        func(error) // Reactor error callback
 }
 
-// Creates a Builder with the default settings.
+// Creates a Builder with an empty configuration.
 func Builder() *builder
 
-// Sets the number of Reactors, the per-Reactor event batch size and command queue capacity, and the error callback.
+// Sets the number of Reactors, the per-Reactor event batch size, command queue capacity, and read buffer size, and the error callback.
 func (this *builder) WithReactor(param ReactorParam) *builder
 
 // Adds a listen address. If the port is 0, it is assigned automatically at start.
@@ -321,14 +324,14 @@ func (this *builder) Build() (server *TCPServer, err error)
 
 * Created by Builder.Build(), it manages accepting connections and starting and stopping the Reactors.
 * Start() starts all Reactors and then starts listening.
-* Stop() stops accepting new connections, requests all Reactors to stop, and waits for them to finish.
+* Stop() stops accepting new connections, stops all Reactors, waits for them to finish, and releases their epoll and eventfd resources. It returns nil regardless of the stop results.
 * Listen address indexes start at 0 in registration order. If you specified port 0, you can query the port actually assigned after Start() succeeds.
 
 ```go
 // Starts all Reactors and listeners.
 func (this *TCPServer) Start() error
 
-// Stops accepting connections and waits for all Reactors to stop.
+// Stops accepting connections, stops all Reactors, and releases their resources.
 func (this *TCPServer) Stop() error
 
 // Returns the number of ClientHandlers registered in all Reactors of the TCPServer.
@@ -353,7 +356,7 @@ Because erio **avoids implementation approaches that rely solely on callbacks, s
 package erio
 
 import (
-	"erio/internal"
+	"github.com/netiogreem/erio/internal"
 	"net/netip"
 )
 
@@ -443,8 +446,7 @@ type ClientHandler interface {
 ```Go
 // Creates a HandlerContext for a client TCP connection.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddress netip.AddrPort,
-	readBufferSize uint32, writeBufferSize uint32,
-	commandQuota uint32, soLingerSecs int) (*HandlerContext, error)
+	writeBufferSize uint32, commandQuota uint32, soLingerSecs int) (*HandlerContext, error)
 
 // Reuses the existing buffers, commandQuota, and soLingerSecs, and reinitializes the object with the given connection information.
 // Does not allocate new buffers.

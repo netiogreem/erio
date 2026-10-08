@@ -47,6 +47,7 @@ const (
 	ErrTCPReactorStateNotStop                TCPReactorError = "erio: tcp reactor is not in the Stop state"
 	ErrTCPReactorStateNotCleanup             TCPReactorError = "erio: tcp reactor is not in the Cleanup state"
 	ErrTCPReactorUninitialized               TCPReactorError = "erio: tcp reactor is uninitialized"
+	ErrTCPReactorInvalidReadBufferSize       TCPReactorError = "erio: invalid tcp reactor read buffer size"
 )
 
 // TCPReactor sequentially processes commands, send/receive, and timer callbacks of TCP connections
@@ -62,6 +63,7 @@ type TCPReactor struct {
 	commands             *commandMailbox                           // Command queue that passes external requests to the event loop.
 	commandsReserveSize  uint32                                    // Initial reserved count of the command arrays.
 	registerCommandQuota uint32                                    // Maximum number of pending registration commands of the Reactor.
+	readBuffer           []byte                                    // Receive buffer reused for every read.
 	handlers             map[internal.FileDescriptor]ClientHandler // Per-FD Handlers registered with this Reactor.
 	handlerCounter       *atomic.Uint32                            // Handler counter that increases and decreases on client registration and removal and can be shared with other Reactors.
 	clientTimer          *clientTimer                              // Manages the nearest timer expiration time for each Handler.
@@ -78,15 +80,22 @@ type TCPReactor struct {
 //   - commandsReserveSize: initial reserved count for each of the two command arrays, and it must
 //     be 1 or more.
 //   - registerCommandQuota: maximum number of RegisterHandler requests.
+//   - readBufferSize: size in bytes of the receive buffer of the Reactor, and it must be 1 or more.
 //   - ErrorCallback: callback that delivers Reactor errors, and notification is skipped if it is
 //     nil.
 //
 // It returns the created Reactor and the creation error.
+// It returns ErrTCPReactorInvalidReadBufferSize if readBufferSize is 0 or too large.
 func NewTCPReactor(
 	eventBatchSize uint32,
 	commandsReserveSize uint32,
 	registerCommandQuota uint32,
+	readBufferSize uint32,
 	ErrorCallback func(error)) (*TCPReactor, error) {
+	if readBufferSize == 0 || uint64(readBufferSize) > uint64(^uint(0)>>1) {
+		return nil, ErrTCPReactorInvalidReadBufferSize
+	}
+
 	epoller, err := internal.NewEpoller(eventBatchSize)
 	if err != nil {
 		return nil, err
@@ -104,6 +113,7 @@ func NewTCPReactor(
 		registerCommandQuota: registerCommandQuota,
 		commandFD:            internal.FileDescriptor(commandFD),
 		commands:             nil,
+		readBuffer:           make([]byte, int(readBufferSize)),
 		handlers:             make(map[internal.FileDescriptor]ClientHandler),
 		handlerCounter:       &atomic.Uint32{},
 		clientTimer:          newClientTimer(),
@@ -137,13 +147,13 @@ func (this *TCPReactor) Init() error {
 			return ErrTCPReactorStateNotCleanup
 		}
 
-		reactor, err := NewTCPReactor(this.eventBatchSize, this.commandsReserveSize, this.registerCommandQuota, this.errorCallback)
+		reactor, err := NewTCPReactor(this.eventBatchSize, this.commandsReserveSize, this.registerCommandQuota, uint32(len(this.readBuffer)), this.errorCallback)
 		if err != nil {
 			return err
 		}
 
-		// The state lock, run signals, and shared counter are kept, and the newly created resources
-		// are taken over.
+		// The state lock, run signals, shared counter, and receive buffer are kept, and the newly
+		// created resources are taken over.
 		this.epoller = reactor.epoller
 		this.commands = reactor.commands
 		this.commandFD = reactor.commandFD

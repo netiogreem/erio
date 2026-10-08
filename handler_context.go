@@ -34,7 +34,6 @@ const (
 	ErrHandlerContextInvalidFileDescriptor HandlerContextError = "erio: invalid handler context file descriptor"
 	ErrHandlerContextInvalidPeerAddrPort   HandlerContextError = "erio: invalid handler context peer address"
 	ErrHandlerContextInvalidListenAddrPort HandlerContextError = "erio: invalid handler context listen address"
-	ErrHandlerContextInvalidReadBufferSize HandlerContextError = "erio: invalid handler context read buffer size"
 	ErrHandlerContextInvalidCommandQuota   HandlerContextError = "erio: invalid handler context command quota"
 )
 
@@ -46,7 +45,6 @@ type HandlerContext struct {
 	open           atomic.Bool              // Whether the connection is usable
 	handlerFD      internal.FileDescriptor  // File descriptor duplicated from the client connection
 	writeBuffer    *internal.BufferDirector // Send buffer
-	readBuffer     []byte                   // Receive buffer
 	soLingerSecs   int                      // SO_LINGER time (seconds) to apply on a forced close
 	handler        ClientHandler            // Connection event handler
 	commands       *commandMailbox          // TCPReactor command management
@@ -70,7 +68,6 @@ type HandlerContext struct {
 //   - handlerFD: file descriptor of the client TCP connection. It must not be negative.
 //   - listenAddrPort: address and port of the listener that accepted the connection.
 //     It must be a valid address.
-//   - readBufferSize: receive buffer size (bytes). 0 is not allowed.
 //   - writeBufferSize: send buffer size (bytes). It is a double buffer for reducing locking, so it
 //     uses twice the specified size.
 //     If the total including data waiting to be sent exceeds this size, Write returns an error
@@ -91,11 +88,9 @@ type HandlerContext struct {
 // ErrHandlerContextInvalidListenAddrPort if listenAddrPort is not valid,
 // ErrHandlerContextInvalidCommandQuota if commandQuota is 0,
 // ErrHandlerContextInvalidPeerAddrPort if the peer address cannot be retrieved,
-// ErrHandlerContextInvalidReadBufferSize if readBufferSize is 0 or too large,
 // and ErrBufferDirectorInvalidSize if writeBufferSize is 0 or too large.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
-	readBufferSize uint32, writeBufferSize uint32,
-	commandQuota uint32, soLingerSecs int) (*HandlerContext, error) {
+	writeBufferSize uint32, commandQuota uint32, soLingerSecs int) (*HandlerContext, error) {
 
 	if commandQuota == 0 {
 		return nil, ErrHandlerContextInvalidCommandQuota
@@ -106,13 +101,8 @@ func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
 		return nil, bufferError
 	}
 
-	if readBufferSize == 0 || uint64(readBufferSize) > uint64(^uint(0)>>1) {
-		return nil, ErrHandlerContextInvalidReadBufferSize
-	}
-
 	context := &HandlerContext{
 		writeBuffer:  writeBuffer,
-		readBuffer:   make([]byte, int(readBufferSize)),
 		soLingerSecs: soLingerSecs,
 		commandQuota: commandQuota,
 	}
@@ -155,7 +145,6 @@ func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.
 		return err
 	}
 
-	clear(this.readBuffer)
 	this.open.Store(false)
 	this.handlerFD = handlerFD
 	this.handler = nil
@@ -186,7 +175,6 @@ func (this *HandlerContext) Reset() error {
 		return err
 	}
 
-	clear(this.readBuffer)
 	this.open.Store(false)
 	this.handlerFD = -1
 	// this.soLingerSecs = 0
@@ -455,22 +443,24 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error {
 	return this.commands.EnqueueUnsetTimeout(this.handler, timerKey)
 }
 
-// onReadable passes received data to OnRead.
-// To keep the data after OnRead, the callback must copy it.
+// onReadable reads into readBuffer and passes received data to OnRead.
+// readBuffer is shared by all connections of the Reactor, so to keep the data after OnRead,
+// the callback must copy it.
 // Receive processing errors are reported through OnError.
 //
 //   - readAll: if true, it reads all currently receivable data, and if false, it receives only
 //     once.
+//   - readBuffer: receive buffer of the Reactor. It must not be empty.
 //
 // Reading, writing, and closing the connection are all done only in the Reactor goroutine, so it
 // uses handlerFD directly without rawConn.Control.
-func (this *HandlerContext) onReadable(readAll bool) {
+func (this *HandlerContext) onReadable(readAll bool, readBuffer []byte) {
 	for {
 		var recvBytes int
 		var recvError error
 		for {
 			r, _, errno := syscall.RawSyscall(syscall.SYS_READ, uintptr(this.handlerFD),
-				uintptr(unsafe.Pointer(&this.readBuffer[0])), uintptr(len(this.readBuffer)))
+				uintptr(unsafe.Pointer(&readBuffer[0])), uintptr(len(readBuffer)))
 			recvBytes, recvError = int(r), nil
 			if errno != 0 {
 				recvError = errno
@@ -481,7 +471,7 @@ func (this *HandlerContext) onReadable(readAll bool) {
 		}
 
 		if recvBytes > 0 {
-			this.handler.OnRead(this, this.readBuffer[:recvBytes:recvBytes])
+			this.handler.OnRead(this, readBuffer[:recvBytes:recvBytes])
 		}
 
 		if recvError == syscall.EAGAIN || recvError == syscall.EWOULDBLOCK {

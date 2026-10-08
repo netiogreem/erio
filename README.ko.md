@@ -13,7 +13,7 @@ Reactor 패턴으로 Linux epoll을 사용하여 입출력 다중화를 처리�
 erio는 다음과 같은 경우에 적합합니다.
 
 * 세션을 유지하면서, 해당 세션 내의 데이터를 세션 내에서 락 없이 변경하고 싶을 때
-* 세션 내에서 락이나 복잡한 코드 없이 독립적인 타이머(예: 유휴 연결 감지, 인증 타임아웃)가 필요할 때
+* 세션 내에서 락이나 복잡한 코드 없이 독립적인 여러 타이머(예: 유휴 연결 감지, 인증 타임아웃)가 필요할 때
 * 외부 고루틴에서 세션 고루틴으로 안전한 비동기 이벤트 전달(예: Write, PostUserEvent 사용)이 필요할 때
 
 ## 2. 요구사항
@@ -37,7 +37,7 @@ erio는 다음과 같은 경우에 적합합니다.
 * **외부 고루틴에서 세션 제어**
   * HandlerContext의 Write, SetTimeout, UnsetTimeout, Close, PostUserEvent는 외부 고루틴에서 별도의 추가 작업(동기화 작업따위) 없이 호출할 수 있습니다.
 * **원하는 세션에 사용자 데이터셋의 비동기 전달**
-  * 외부 고루틴에서 원하는 세션에 사용자가 정의한 데이터셋을 비동기로 전달하고, 해당 세션의 Reactor 고루틴에서 받을 수 있습니다.
+  * 외부 고루틴에서 원하는 세션에 사용자가 정의한 데이터셋을 비동기로 전달하고, 해당 세션이 동작하는 고루틴의 세션에서 받을 수 있습니다.
 
 ## 4. 성능
 
@@ -99,7 +99,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/netiogreeme/erio"
+	"github.com/netiogreem/erio"
 )
 
 // HandlerContext에 별칭을 부여합니다.
@@ -120,9 +120,9 @@ const ALIVE_TIMER_KEY uint64 = 10
 // Acceptor가 연결을 수락할 때마다 호출합니다.
 // 참고: client_handler.go::ClientHandlerFactory
 func EchoHandlerFactory(fd erio.FileDescriptor, listenAddr netip.AddrPort) (erio.ClientHandler, error) {
-	// 수신 버퍼 32KiB, 송신 버퍼 64KiB, 명령 한도 64개, SO_LINGER 5초.
+	// 송신 버퍼 64KiB, 명령 한도 64개, SO_LINGER 5초.
 	// 참고: handler_context.go::NewHandlerContext
-	handler, err := erio.NewHandlerContext(fd, listenAddr, 32*1024, 65536, 64, 5)
+	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64, 5)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +195,7 @@ func main() {
 			EventBatchSize:       128,
 			RegisterCommandQuota: 1024,
 			CommandReserveSize:   4096,
+			ReadBufferSize:       32 * 1024, // Reactor별 수신 버퍼입니다.
 			ErrorCallback:        reactorError}).
 		// 두 주소에서 연결을 수락합니다.
 		WithListenAddress("127.0.0.1:2000").
@@ -272,13 +273,14 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
 * Builder는 플루언트 인터페이스로 구성되어 있어 메서드 체이닝으로 호출, 서버를 구성할 수 있습니다.
   * 설정이 올바르다면, TCPServer 인스턴스를 반환 받습니다.
 * WithReactor
-  * Reactor 수, Reactor별 이벤트 배치 크기·명령 대기열 용량과 오류 콜백을 설정합니다.
+  * Reactor 수, Reactor별 이벤트 배치 크기, 명령 대기열 용량, 수신 버퍼 크기와 오류 콜백을 설정합니다.
   * Reactor는 Epoll 이벤트를 처리하는 인스턴스로 syscall.Epoll 특성상 1 스레드를 점유합니다.
   * ReactorParam
     * Count: Reactor의 개수 입니다.
     * EventBatchSize: epoll 대기시 한번에 받을 최대 이벤트 수 입니다.
     * RegisterCommandQuota: Reactor에 등록할 수 있는 대기열 한도 입니다.
     * CommandReserveSize: 명령 대기열의 예약 크기 입니다.
+    * ReadBufferSize: Reactor별 수신 버퍼의 크기 입니다.
     * ErrorCallback: Reactor 오류 콜백 함수 입니다.
 * WithListenAddress(listenAddress string)
   * 리스닝 주소를 등록 합니다.(ex: 172.30.10.10:30010)
@@ -295,13 +297,14 @@ type ReactorParam struct {
 	EventBatchSize       uint32      // epoll 대기 한 번에 받을 최대 이벤트 수
 	RegisterCommandQuota uint32      // Register 명령 대기 한도
 	CommandReserveSize   uint32      // 명령 대기열의 예약 크기 입니다.
+	ReadBufferSize       uint32      // Reactor별 수신 버퍼 크기
 	ErrorCallback        func(error) // Reactor 오류 콜백 함수
 }
 
-// 기본 설정으로 Builder를 생성합니다.
+// 빈 설정으로 Builder를 생성합니다.
 func Builder() *builder
 
-// Reactor 수, Reactor별 이벤트 배치 크기·명령 대기열 용량과 오류 콜백을 설정합니다.
+// Reactor 수, Reactor별 이벤트 배치 크기, 명령 대기열 용량, 수신 버퍼 크기와 오류 콜백을 설정합니다.
 func (this *builder) WithReactor(param ReactorParam) *builder
 
 // 리스닝 주소를 추가합니다. 포트가 0이면 시작 시 자동 할당됩니다.
@@ -321,14 +324,14 @@ func (this *builder) Build() (server *TCPServer, err error)
 
 * Builder.Build()로 생성하며, 연결 수락과 Reactor들의 시작·종료를 관리합니다.
 * Start()는 모든 Reactor를 시작한 뒤 리스닝을 시작합니다.
-* Stop()은 새로운 연결 수락을 중단하고 모든 Reactor에 종료를 요청한 뒤 종료 완료를 기다립니다.
+* Stop()은 새로운 연결 수락을 중단하고 모든 Reactor를 종료한 뒤 종료 완료를 기다리고, epoll과 eventfd 자원을 해제합니다. 종료 결과와 관계없이 nil을 반환합니다.
 * 리스닝 주소의 인덱스는 등록 순서대로 0부터 시작합니다. 포트를 0으로 지정했다면 Start() 성공 후 실제 할당된 포트를 조회할 수 있습니다.
 
 ```go
 // 모든 Reactor와 리스너를 시작합니다.
 func (this *TCPServer) Start() error
 
-// 연결 수락을 중단하고 모든 Reactor의 종료를 기다립니다.
+// 연결 수락을 중단하고 모든 Reactor를 종료한 뒤 자원을 해제합니다.
 func (this *TCPServer) Stop() error
 
 // TCPServer가 가진 모든 Reactor에 등록된 ClientHandler 수를 반환합니다.
@@ -353,7 +356,7 @@ erio는 **On{Event}(완료 콜백 함수) 구조와 같은 콜백에만 의존�
 package erio
 
 import (
-	"erio/internal"
+	"github.com/netiogreem/erio/internal"
 	"net/netip"
 )
 
@@ -440,8 +443,7 @@ type ClientHandler interface {
 ```Go
 // 클라이언트 TCP 연결을 위한 HandlerContext를 생성합니다.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddress netip.AddrPort,
-	readBufferSize uint32, writeBufferSize uint32,
-	commandQuota uint32, soLingerSecs int) (*HandlerContext, error)
+	writeBufferSize uint32, commandQuota uint32, soLingerSecs int) (*HandlerContext, error)
 
 // 기존 버퍼, commandQuota, soLingerSecs를 재활용하고 지정한 연결 정보로 생성 직후 상태를 만듭니다.
 // 버퍼를 새로 할당하지 않습니다.

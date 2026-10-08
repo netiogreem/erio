@@ -48,12 +48,13 @@ func (this *TCPReactor) handleEvent(fd internal.FileDescriptor, event syscall.Ep
 	}
 }
 
-// handleEventReadable runs the receive processing of the ClientHandler.
+// handleEventReadable runs the receive processing of the ClientHandler with the receive buffer of
+// this Reactor.
 //
 //   - handler: ClientHandler on which the read event occurred.
 //   - isClosed: true if a close event was delivered together.
 func (this *TCPReactor) handleEventReadable(handler ClientHandler, isClosed bool) {
-	handler.context().onReadable(isClosed == true)
+	handler.context().onReadable(isClosed == true, this.readBuffer)
 }
 
 // handleEventWritable handles write events for the ClientHandler.
