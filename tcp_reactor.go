@@ -326,7 +326,7 @@ func (this *TCPReactor) postRun() (err error) {
 
 	this.discardCommands()
 	for _, handler := range this.handlers {
-		this.removeHandler(handler, ErrTCPReactorStopped, true)
+		this.removeHandler(handler, ErrTCPReactorStopped, false)
 	}
 
 	this.stopped.BroadcastWith(this.epoller.Unregister(this.commandFD))

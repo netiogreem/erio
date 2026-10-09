@@ -65,8 +65,9 @@ type ClientHandler interface {
 	//   - closeReason: reason the connection was closed
 	//
 	// closeReason is ErrTCPReactorHangup if the connection is lost, ErrTCPReactorReadHangup if the
-	// peer closes its sending side or Close closes the receiving side,
-	// and ErrTCPReactorStopped if TCPReactor is stopped.
+	// peer closes its sending side or TCPReactor processes a close request from
+	// HandlerContext.Close or HandlerContext.Abort, and ErrTCPReactorStopped if TCPReactor is
+	// stopped.
 	OnClose(context *HandlerContext, closeReason error)
 
 	// GetCommandQuota returns the command limit.

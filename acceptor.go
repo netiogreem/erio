@@ -329,8 +329,8 @@ func (this *Acceptor) acceptedConnection(netTCPConn *net.TCPConn, listenAddrPort
 }
 
 // rejectAcceptedCallback handles the rejection.
-// If there is a HandlerContext and the FD is valid, it closes the duplicated FD with the configured
-// SO_LINGER value through abortConnection.
+// If there is a HandlerContext and the FD is valid, it closes the duplicated FD with SO_LINGER 0
+// through abortConnection.
 // If HandlerContext is nil or the FD is negative, it rejects with rejectConnection.
 // The rejection reason and cleanup errors are passed to the error callback.
 //

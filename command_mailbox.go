@@ -20,6 +20,8 @@ const (
 	commandWrite
 	commandRegisterHandler
 	commandUser
+	commandClose // Normal connection close command
+	commandAbort // Forced (RST) connection close command
 )
 
 // commandMailboxError represents an error returned by commandMailbox.
@@ -268,6 +270,32 @@ func (this *commandMailbox) EnqueueUserEvent(handler ClientHandler, userEventDat
 	})
 }
 
+// EnqueueClose enqueues a normal close command for the Handler.
+// It is not subject to the per-connection quota and keeps the enqueue order with other commands.
+//
+//   - handler: Handler to close.
+//
+// It returns an error if closed, if the Handler is nil, or if the notification fails.
+func (this *commandMailbox) EnqueueClose(handler ClientHandler) error {
+	return this.enqueue(command{
+		commandType: commandClose,
+		handler:     handler,
+	})
+}
+
+// EnqueueAbort enqueues a forced (RST) close command for the Handler.
+// It is not subject to the per-connection quota and keeps the enqueue order with other commands.
+//
+//   - handler: Handler to close.
+//
+// It returns an error if closed, if the Handler is nil, or if the notification fails.
+func (this *commandMailbox) EnqueueAbort(handler ClientHandler) error {
+	return this.enqueue(command{
+		commandType: commandAbort,
+		handler:     handler,
+	})
+}
+
 // EnqueueStop closes enqueuing of new commands and reserves a stop command.
 // The stop command is separate from the quotas and is delivered last, after the pending regular
 // commands, at the next Drain.
@@ -344,6 +372,13 @@ func (this *commandMailbox) enqueue(command command) error {
 		return this.enqueueHandlerCommand(command)
 	case commandSetTimeout, commandUnsetTimeout, commandUser:
 		return this.enqueueHandlerCommand(command)
+	case commandClose, commandAbort:
+		// Close commands are not counted in the per-connection quota. HandlerContext enqueues at
+		// most one per connection.
+		if command.handler == nil {
+			return ErrCommandMailboxNilHandler
+		}
+		return this.appendCommand(command)
 	default:
 		return ErrCommandMailboxInvalidCommand
 	}

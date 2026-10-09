@@ -35,7 +35,7 @@ erio는 다음과 같은 경우에 적합합니다.
 * **하나의 세션에서 멀티 타이머**
   * 세션 이벤트가 처리되는 동일한 고루틴에서 SetTimeout(timerKey, timeout), OnTimeout(timerKey) 타이머키로 응답 대기·유휴 연결·인증 제한 시간을 각각 관리할 수 있습니다.
 * **외부 고루틴에서 세션 제어**
-  * HandlerContext의 Write, SetTimeout, UnsetTimeout, Close, PostUserEvent는 외부 고루틴에서 별도의 추가 작업(동기화 작업따위) 없이 호출할 수 있습니다.
+  * HandlerContext의 Write, SetTimeout, UnsetTimeout, Close, Abort, PostUserEvent는 외부 고루틴에서 별도의 추가 작업(동기화 작업따위) 없이 호출할 수 있습니다.
 * **원하는 세션에 사용자 데이터셋의 비동기 전달**
   * 외부 고루틴에서 원하는 세션에 사용자가 정의한 데이터셋을 비동기로 전달하고, 해당 세션이 동작하는 고루틴의 세션에서 받을 수 있습니다.
 
@@ -92,6 +92,8 @@ erio와 gnet 모두 공개 API를 사용하며 수신된 패킷별로 하나의 
 
 ## 빠른 시작
 
+> 아래 코드는 examples/echo_server/main.go와 같습니다. 새 서버를 만들 때 템플릿으로 활용하실 수 있습니다.
+
 erio는 **On{Event}(onComplete func(...)) 패턴**의 **콜백에만 의존하는 구현 방식을 지양**합니다.
 
 대신 사용자가 인터페이스의 콜백 이벤트들을 직접 구현하도록 설계하고, **오용(misuse)**하기 어려운 구조를 만드는 데 노력하였습니다.
@@ -142,9 +144,9 @@ const ALIVE_TIMER_KEY uint64 = 10
 // Acceptor가 연결을 수락할 때마다 호출합니다.
 // 참고: client_handler.go::ClientHandlerFactory
 func EchoHandlerFactory(fd erio.FileDescriptor, listenAddr netip.AddrPort) (erio.ClientHandler, error) {
-	// 송신 버퍼 64KiB, 명령 한도 64개, SO_LINGER 5초.
+	// 송신 버퍼 64KiB, 명령 한도 64개.
 	// 참고: handler_context.go::NewHandlerContext
-	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64, 5)
+	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64)
 	if err != nil {
 		return nil, err
 	}
@@ -439,7 +441,7 @@ type ClientHandler interface {
 	//   - closeReason: 연결 종료 사유
 	//
 	// closeReason은 연결이 끊기면 ErrTCPReactorHangup,
-	// 상대방이 송신 측을 닫거나 Close를 통해 수신 측을 닫으면 ErrTCPReactorReadHangup,
+	// 상대방이 송신 측을 닫거나 Close, Abort 요청이 처리되면 ErrTCPReactorReadHangup,
 	// TCPReactor가 중지되면 ErrTCPReactorStopped가 됩니다.
 	OnClose(context *HandlerContext, closeReason error)
 
@@ -460,20 +462,20 @@ type ClientHandler interface {
 
 * ClientHandler에 임베딩하여 사용해야 합니다.
 * HandlerContext는 ClientHandler를 제어하는 Type으로써 HandlerContext의 Init() and Reset() 메서드를 제외한 다른 메서드들은 외부 고루틴에서도 사용할 수 있는 thread-safe 메서드들 입니다.
-* HandlerContext 메서드의 명령 요청(Write, SetTimeout, UnsetTimeout, Close, PostUserEvent) 호출은 이벤트 직렬화를 위해 TCPReactor로의 비동기 요청이며, 이 요청은 TCPReactor에서 처리되고 ClientHandler의 해당 함수들을 호출하여 줍니다.
+* HandlerContext 메서드의 명령 요청(Write, SetTimeout, UnsetTimeout, Close, Abort, PostUserEvent) 호출은 이벤트 직렬화를 위해 TCPReactor로의 비동기 요청이며, 이 요청은 TCPReactor에서 처리되고 ClientHandler의 해당 함수들을 호출하여 줍니다.
 
 ```Go
 // 클라이언트 TCP 연결을 위한 HandlerContext를 생성합니다.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddress netip.AddrPort,
-	writeBufferSize uint32, commandQuota uint32, soLingerSecs int) (*HandlerContext, error)
+	writeBufferSize uint32, commandQuota uint32) (*HandlerContext, error)
 
-// 기존 버퍼, commandQuota, soLingerSecs를 재활용하고 지정한 연결 정보로 생성 직후 상태를 만듭니다.
+// 기존 버퍼와 commandQuota를 재활용하고 지정한 연결 정보로 생성 직후 상태를 만듭니다.
 // 버퍼를 새로 할당하지 않습니다.
 // Reactor에 등록하기 전(ClientHandlerFactory에서 반환하기 전),
 // 또는 OnClose 안에서 마지막으로 호출해야 안전합니다
 func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddress netip.AddrPort) error
 
-// commandQuota와 soLingerSecs를 제외한 모든 상태를 비우고 handlerFD를 -1로 만듭니다.
+// commandQuota를 제외한 모든 상태를 비우고 handlerFD를 -1로 만듭니다.
 // 버퍼는 용량을 유지합니다. handlerFD를 닫지 않으므로 연결이 닫힌 뒤 호출해야 합니다.
 // Reactor에 등록하기 전(ClientHandlerFactory에서 반환하기 전),
 // OnClose 안에서 마지막으로 호출해야 안전합니다.
@@ -494,12 +496,6 @@ func (this *HandlerContext) GetCommandQuota() uint32
 // 데이터를 송신 버퍼에 복사하고 송신 명령을 요청합니다. streamID로 OnWritten에서 구분할 수 있습니다.
 func (this *HandlerContext) Write(streamID int32, buffer []byte) error
 
-// 닫힌 상태를 먼저 기록하고 연결의 강제종료(읽기 방향 종료, SO_LINGER 설정값 사용)를 요청합니다.
-func (this *HandlerContext) Close() error
-
-// 세션이 닫힌 상태인지 확인합니다.
-func (this *HandlerContext) IsClosed() bool
-
 // 지정한 키의 타이머 설정 또는 교체 명령을 요청합니다.
 // 한번 호출로 지속적으로 OnTimeout을 호출 하는 것은 아닙니다. 1회성 입니다.
 func (this *HandlerContext) SetTimeout(timerKey uint64, timeout time.Duration) error
@@ -509,6 +505,17 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error
 
 // 사용자 명령을 접수하여 해당 세션의 Reactor 고루틴에서 ClientHandler.OnUserEvent로 전달합니다.
 func (this *HandlerContext) PostUserEvent(userEventData any) error
+
+// 닫힌 상태를 먼저 기록하고 연결의 일반 종료를 요청합니다.
+// 읽지 않은 수신 데이터가 남아 있으면 상대방은 FIN 대신 RST를 받습니다.
+func (this *HandlerContext) Close() error
+
+// 닫힌 상태를 먼저 기록하고 연결의 강제 종료(RST)를 요청합니다.
+// OnWritten으로 완료를 알린 데이터라도 상대방에게 전달되지 않았으면 버려집니다.
+func (this *HandlerContext) Abort() error
+
+// 세션이 닫힌 상태인지 확인합니다.
+func (this *HandlerContext) IsClosed() bool
 ```
 
 아래와 같이 사용할 수 있습니다.
@@ -549,4 +556,4 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
 * **OnWritten은 상대방의 수신 완료를 의미하지 않습니다.**
   * 해당 데이터가 로컬 커널에 모두 전달되었다는 의미입니다. 상대방의 수신이나 업무 처리 완료를 확인하려면 프로토콜 수준의 응답이 필요합니다.
 * **Close는 남은 데이터의 송신 완료를 보장하지 않습니다.**
-  * Close()는 닫힌 상태를 기록하고 읽기 종료를 요청하며, 실제 연결 정리는 Reactor가 수행하고 정리된 연결은 ClientHandler.OnClose를 호출하여 줍니다.
+  * Close()는 닫힌 상태를 기록하고 Reactor에 연결 종료를 요청하며, 실제 연결 정리는 Reactor가 수행합니다. 아직 소켓에 쓰지 않고 HandlerContext 송신 버퍼에 남은 데이터는 버려집니다. 정리가 끝나면 Reactor가 ClientHandler.OnClose를 호출하여 줍니다.

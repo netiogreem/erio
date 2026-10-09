@@ -46,7 +46,6 @@ type HandlerContext struct {
 	open           atomic.Bool              // Whether the connection is usable
 	handlerFD      internal.FileDescriptor  // File descriptor duplicated from the client connection
 	writeBuffer    *internal.BufferDirector // Write buffer
-	soLingerSecs   int                      // SO_LINGER time (seconds) to apply on a forced close
 	handler        ClientHandler            // Connection event handler
 	commands       *commandMailbox          // TCPReactor command management
 	commandQuota   uint32                   // Per-connection limit on the total of pending timer, write, and user event commands
@@ -79,8 +78,6 @@ type HandlerContext struct {
 //     Write calls made while the Reactor is processing epoll events or expired timers are not
 //     included, regardless of the calling goroutine.
 //     0 is not allowed.
-//   - soLingerSecs: SO_LINGER time (seconds) to apply when the Reactor forcibly closes the
-//     connection
 //
 // It returns the created HandlerContext and nil on success,
 // and returns nil and an error if an argument is invalid or if preparing the connection or buffers
@@ -91,7 +88,7 @@ type HandlerContext struct {
 // ErrHandlerContextInvalidPeerAddrPort if the peer address cannot be retrieved,
 // and internal.ErrBufferDirectorInvalidSize (wrapped) if writeBufferSize is 0 or too large.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
-	writeBufferSize uint32, commandQuota uint32, soLingerSecs int) (*HandlerContext, error) {
+	writeBufferSize uint32, commandQuota uint32) (*HandlerContext, error) {
 
 	if commandQuota == 0 {
 		return nil, ErrHandlerContextInvalidCommandQuota
@@ -104,7 +101,6 @@ func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
 
 	context := &HandlerContext{
 		writeBuffer:  writeBuffer,
-		soLingerSecs: soLingerSecs,
 		commandQuota: commandQuota,
 	}
 	if err := context.Init(handlerFD, listenAddrPort); err != nil {
@@ -114,7 +110,7 @@ func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
 	return context, nil
 }
 
-// Init reuses the write buffer, commandQuota, and soLingerSecs, and sets up the state right after
+// Init reuses the write buffer and commandQuota, and sets up the state right after
 // creation with the given connection information.
 // It does not allocate a new write buffer and keeps its capacity.
 // If validation fails, it does not change the current object.
@@ -162,7 +158,7 @@ func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.
 	return nil
 }
 
-// Reset clears all state of HandlerContext except commandQuota and soLingerSecs.
+// Reset clears all state of HandlerContext except commandQuota.
 // The write buffer is emptied while keeping its capacity, and handlerFD is set to -1.
 // It does not close handlerFD, so it must be called after the FD is closed.
 // It must not be called concurrently with other methods.
@@ -181,7 +177,6 @@ func (this *HandlerContext) Reset() error {
 
 	this.open.Store(false)
 	this.handlerFD = -1
-	// this.soLingerSecs = 0
 	this.handler = nil
 	this.commands = nil
 	// this.commandQuota = 0
@@ -335,36 +330,6 @@ func (this *HandlerContext) Write(streamID int32, buffer []byte) error {
 	})
 }
 
-// Close requests a forced close of the client connection. The socket close leaves TIME_WAIT
-// depending on the configured SO_LINGER value.
-// Even if the socket close request fails, this connection cannot be used again, and calling it
-// again returns ErrHandlerContextClosed.
-// A return does not mean the close is complete. The actual connection cleanup is performed by
-// TCPReactor.
-// It is not subject to the command processing limit.
-//
-// It returns nil on success, and returns an error if not connected or if the close request fails.
-// It returns ErrHandlerContextClosed before registration.
-func (this *HandlerContext) Close() error {
-	if !this.open.CompareAndSwap(true, false) {
-		return ErrHandlerContextClosed
-	}
-
-	if this.handler == nil || this.commands == nil {
-		return ErrHandlerContextUninitialized
-	}
-
-	return syscall.Shutdown(int(this.handlerFD), syscall.SHUT_RD)
-}
-
-// IsClosed checks whether the connection is closed.
-//
-// It returns true if closed and false if usable, and it is true even before TCPReactor
-// registration.
-func (this *HandlerContext) IsClosed() bool {
-	return !this.open.Load()
-}
-
 // PostUserEvent requests user event processing. It can be called from external goroutines.
 // For data passed with PostUserEvent, ClientHandler.OnUserEvent is called in the Reactor goroutine.
 // Data passed with PostUserEvent must not be modified by external goroutines until
@@ -441,6 +406,53 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error {
 	}
 
 	return this.commands.EnqueueUnsetTimeout(this.handler, timerKey)
+}
+
+// Close requests a normal close of the connection and returns without waiting.
+// OnClose is called after the connection is closed.
+// Data passed to Write that has not yet been written to the socket is discarded.
+// If received data remains unread, the peer receives RST instead of FIN.
+// It is not subject to the command quota.
+//
+// It returns ErrHandlerContextClosed if already closed or not registered, or an error if the
+// request cannot be submitted.
+func (this *HandlerContext) Close() error {
+	if !this.open.CompareAndSwap(true, false) {
+		return ErrHandlerContextClosed
+	}
+
+	if this.handler == nil || this.commands == nil {
+		return ErrHandlerContextUninitialized
+	}
+
+	return this.commands.EnqueueClose(this.handler)
+}
+
+// Abort requests a forced close of the connection with RST and returns without waiting.
+// OnClose is called after the connection is closed.
+// Data not yet delivered to the peer is discarded, including data already reported by OnWritten.
+// It is not subject to the command quota.
+//
+// It returns ErrHandlerContextClosed if already closed or not registered, or an error if the
+// request cannot be submitted.
+func (this *HandlerContext) Abort() error {
+	if !this.open.CompareAndSwap(true, false) {
+		return ErrHandlerContextClosed
+	}
+
+	if this.handler == nil || this.commands == nil {
+		return ErrHandlerContextUninitialized
+	}
+
+	return this.commands.EnqueueAbort(this.handler)
+}
+
+// IsClosed checks whether the connection is closed.
+//
+// It returns true if closed and false if usable, and it is true even before TCPReactor
+// registration.
+func (this *HandlerContext) IsClosed() bool {
+	return !this.open.Load()
 }
 
 // onReadable reads into readBuffer and passes received data to OnRead.
@@ -571,7 +583,7 @@ func (this *HandlerContext) onTimeout() (nextExpiration time.Time, hasTimer bool
 // 		errors.Is(err, syscall.EPIPE) ||
 // 		errors.Is(err, syscall.ESHUTDOWN)
 
-// abortConnection closes the client connection with the configured SO_LINGER value.
+// abortConnection closes the client connection with SO_LINGER 0.
 // It attempts to close the connection even if setting SO_LINGER fails.
 //
 // It returns nil on success, and returns an error if setting SO_LINGER or closing the connection
@@ -588,17 +600,11 @@ func (this *HandlerContext) closeConnection() error {
 }
 
 // closeFileDescriptor closes handlerFD in the Reactor goroutine.
-// If setLinger is true, it sets SO_LINGER using the same rules as net.TCPConn.SetLinger and then
-// closes it.
+// If setLinger is true, it sets SO_LINGER 0 and then closes it.
 func (this *HandlerContext) closeFileDescriptor(setLinger bool) error {
 	var lingerError error
 	if setLinger {
-		linger := syscall.Linger{}
-		if this.soLingerSecs >= 0 {
-			linger.Onoff = 1
-			linger.Linger = int32(this.soLingerSecs)
-		}
-
+		linger := syscall.Linger{Onoff: 1, Linger: 0}
 		lingerError = os.NewSyscallError("setsockopt", syscall.SetsockoptLinger(int(this.handlerFD), syscall.SOL_SOCKET, syscall.SO_LINGER, &linger))
 	}
 

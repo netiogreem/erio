@@ -33,7 +33,7 @@ erio is a good fit for the following use cases:
 * **Multiple timers per session**
   * On the same goroutine that handles session events, you can use timer keys with SetTimeout(timerKey, timeout) and OnTimeout(timerKey) to manage response wait times, idle-connection timeouts, and authentication time limits separately.
 * **Session control from other goroutines**
-  * HandlerContext's Write, SetTimeout, UnsetTimeout, Close, and PostUserEvent can be called from other goroutines without any extra work (such as synchronization).
+  * HandlerContext's Write, SetTimeout, UnsetTimeout, Close, Abort, and PostUserEvent can be called from other goroutines without any extra work (such as synchronization).
 * **Asynchronous delivery of user data to a target session**
   * User-defined data can be sent asynchronously from another goroutine to any session and received in that session on the goroutine the session runs on.
 
@@ -90,6 +90,8 @@ After receiving data from a client, the test server sends a 65536-byte acknowled
 
 ## Quick Start
 
+> The code below is the same as examples/echo_server/main.go. You can use it as a template when building your own server.
+
 erio **avoids implementation approaches that depend only on callbacks, such as the On{Event}(**onComplete func(...)**) pattern**.
 
 Instead, it is designed so that users implement the interface's event callbacks themselves, and effort has gone into making the design hard to **misuse**.
@@ -140,9 +142,9 @@ const ALIVE_TIMER_KEY uint64 = 10
 // Called each time the Acceptor accepts a connection.
 // See: client_handler.go::ClientHandlerFactory
 func EchoHandlerFactory(fd erio.FileDescriptor, listenAddr netip.AddrPort) (erio.ClientHandler, error) {
-	// Send buffer 64KiB, command quota 64, SO_LINGER 5 seconds.
+	// Send buffer 64KiB, command quota 64.
 	// See: handler_context.go::NewHandlerContext
-	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64, 5)
+	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64)
 	if err != nil {
 		return nil, err
 	}
@@ -445,7 +447,7 @@ type ClientHandler interface {
 	//   - closeReason: reason the connection was closed
 	//
 	// closeReason is ErrTCPReactorHangup if the connection is lost, ErrTCPReactorReadHangup if the
-	// peer closes its sending side or Close closes the receiving side,
+	// peer closes its sending side or a Close or Abort request is processed,
 	// and ErrTCPReactorStopped if TCPReactor is stopped.
 	OnClose(context *HandlerContext, closeReason error)
 
@@ -466,20 +468,20 @@ type ClientHandler interface {
 
 * Must be embedded in a ClientHandler.
 * HandlerContext is the type that controls a ClientHandler, and its methods, except Init() and Reset(), are thread-safe and can also be used from other goroutines.
-* Calls to HandlerContext's command methods (Write, SetTimeout, UnsetTimeout, Close, PostUserEvent) are asynchronous requests to the TCPReactor for serialized event processing; the TCPReactor processes them and calls the corresponding ClientHandler functions.
+* Calls to HandlerContext's command methods (Write, SetTimeout, UnsetTimeout, Close, Abort, PostUserEvent) are asynchronous requests to the TCPReactor for serialized event processing; the TCPReactor processes them and calls the corresponding ClientHandler functions.
 
 ```Go
 // Creates a HandlerContext for a client TCP connection.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
-	writeBufferSize uint32, commandQuota uint32, soLingerSecs int) (*HandlerContext, error)
+	writeBufferSize uint32, commandQuota uint32) (*HandlerContext, error)
 
-// Reuses the existing buffers, commandQuota, and soLingerSecs, and reinitializes the object with the given connection information.
+// Reuses the existing buffers and commandQuota, and reinitializes the object with the given connection information.
 // Does not allocate new buffers.
 // It is safe to call only before the handler is registered with the Reactor (before returning it
 // from ClientHandlerFactory) or as the last call in OnClose.
 func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.AddrPort) error
 
-// Clears all state except commandQuota and soLingerSecs, and sets handlerFD to -1.
+// Clears all state except commandQuota, and sets handlerFD to -1.
 // Buffers keep their capacity. It does not close handlerFD, so call it after the connection is closed.
 // It is safe to call only before the handler is registered with the Reactor (before returning it
 // from ClientHandlerFactory) or as the last call in OnClose.
@@ -500,12 +502,6 @@ func (this *HandlerContext) GetCommandQuota() uint32
 // Copies the data into the send buffer and submits a send command. The streamID identifies it in OnWritten.
 func (this *HandlerContext) Write(streamID int32, buffer []byte) error
 
-// Records the closed state first and requests a forced close of the connection (read-side shutdown, using the SO_LINGER setting).
-func (this *HandlerContext) Close() error
-
-// Reports whether the session is closed.
-func (this *HandlerContext) IsClosed() bool
-
 // Submits a command to set or replace the timer for the given key.
 // One call does not invoke OnTimeout repeatedly; it is one-shot.
 func (this *HandlerContext) SetTimeout(timerKey uint64, timeout time.Duration) error
@@ -515,6 +511,17 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error
 
 // Submits a user command and delivers it to ClientHandler.OnUserEvent on the session's Reactor goroutine.
 func (this *HandlerContext) PostUserEvent(userEventData any) error
+
+// Records the closed state first and requests a normal close of the connection.
+// If received data remains unread, the peer receives RST instead of FIN.
+func (this *HandlerContext) Close() error
+
+// Records the closed state first and requests a forced close (RST) of the connection.
+// Data not yet delivered to the peer is discarded, including data already reported by OnWritten.
+func (this *HandlerContext) Abort() error
+
+// Reports whether the session is closed.
+func (this *HandlerContext) IsClosed() bool
 ```
 
 It can be used as follows.
@@ -555,4 +562,4 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
 * **OnWritten does not mean the peer has received the data.**
   * It means the data has been fully handed over to the local kernel. To confirm the peer's receipt or the completion of application-level processing, you need a protocol-level response.
 * **Close does not guarantee that remaining data is sent.**
-  * Close() records the closed state and requests a read shutdown; the actual connection cleanup is done by the Reactor. Once the cleanup is complete, the Reactor calls ClientHandler.OnClose()
+  * Close() records the closed state and submits a close request to the Reactor; the actual connection cleanup is done by the Reactor. Data in the HandlerContext send buffer that has not been written to the socket is discarded. Once the cleanup is complete, the Reactor calls ClientHandler.OnClose().

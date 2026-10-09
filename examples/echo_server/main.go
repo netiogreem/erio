@@ -31,9 +31,9 @@ const ALIVE_TIMER_KEY uint64 = 10
 // Called each time the Acceptor accepts a connection.
 // See: client_handler.go::ClientHandlerFactory
 func EchoHandlerFactory(fd erio.FileDescriptor, listenAddr netip.AddrPort) (erio.ClientHandler, error) {
-	// Send buffer 64KiB, command quota 64, SO_LINGER 5 seconds.
+	// Send buffer 64KiB, command quota 64.
 	// See: handler_context.go::NewHandlerContext
-	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64, 5)
+	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64)
 	if err != nil {
 		return nil, err
 	}

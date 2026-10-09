@@ -29,7 +29,7 @@ func newTCPServerTest(test testing.TB, listenAddresses ...string) (*erio.TCPServ
 	test.Helper()
 	events := &handlerContextFixture{events: make(chan handlerContextTestEvent, 16)}
 	factory := func(fd erio.FileDescriptor, listenAddress netip.AddrPort) (erio.ClientHandler, error) {
-		context, createError := erio.NewHandlerContext(fd, listenAddress, 64, 8, 0)
+		context, createError := erio.NewHandlerContext(fd, listenAddress, 64, 8)
 		if createError != nil {
 			return nil, createError
 		}

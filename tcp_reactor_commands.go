@@ -47,6 +47,12 @@ func (this *TCPReactor) handleCommands() (isStop bool) {
 		case commandUser:
 			this.handleCommandUser(command.handler, command.userEventData)
 
+		case commandClose:
+			this.removeHandler(command.handler, ErrTCPReactorReadHangup, false)
+
+		case commandAbort:
+			this.removeHandler(command.handler, ErrTCPReactorReadHangup, true)
+
 		default:
 			this.handleError(ErrTCPReactorCommand)
 		}

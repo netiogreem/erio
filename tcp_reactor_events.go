@@ -101,19 +101,19 @@ func (this *TCPReactor) handleEventHangup(handler ClientHandler) {
 	this.removeHandler(handler, ErrTCPReactorHangup, false)
 }
 
-// handleEventReadHangup removes the ClientHandler on which a read-side close event occurred and
-// closes the connection immediately.
+// handleEventReadHangup removes the ClientHandler whose peer closed its sending side and closes
+// the connection without changing SO_LINGER.
 //
 //   - handler: ClientHandler to remove.
 func (this *TCPReactor) handleEventReadHangup(handler ClientHandler) {
-	this.removeHandler(handler, ErrTCPReactorReadHangup, true)
+	this.removeHandler(handler, ErrTCPReactorReadHangup, false)
 }
 
 // removeHandler calls OnClose of the ClientHandler.
 //
 //   - handler: registered Handler to remove from this Reactor.
 //   - closeReason: connection close reason to pass to OnClose.
-//   - soLinger: if true, it applies the configured SO_LINGER value and closes the connection;
+//   - soLinger: if true, it sets SO_LINGER 0 and closes the connection (HandlerContext.Abort);
 //     if false, it closes the connection without changing SO_LINGER.
 func (this *TCPReactor) removeHandler(handler ClientHandler, closeReason error, soLinger bool) {
 	fd := handler.context().fileDescriptor()
