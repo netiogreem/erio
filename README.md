@@ -37,16 +37,18 @@ erio is a good fit for the following use cases:
 * **Asynchronous delivery of user data to a target session**
   * User-defined data can be sent asynchronously from another goroutine to any session and received in that session on the goroutine the session runs on.
 
-## Performance
-
-After receiving data from a client, the test server sends an 8-byte acknowledgment for each packet.
+## Benchmarks
 
 Both erio and gnet use their public APIs to send one response per received packet (one 'Write()' call per received packet).
 
 * AMD Ryzen™ 9 7945HX (32 logical cores), CPU clock 2.85GHz to 3.7GHz
 * 6 cores (1 Acceptor, 5 Reactors) / Clients: 25 separate processes
 
-### erio
+### 8-byte response
+
+After receiving data from a client, the test server sends an 8-byte acknowledgment for each packet.
+
+#### erio
 
 | Client<br />message <br />size | Pipelined<br />requests<br /> per client |       **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |         CPU / RSS |
 | -----------------------------: | ---------------------------------------: | ------------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
@@ -59,12 +61,32 @@ Both erio and gnet use their public APIs to send one response per received packe
 
 > Send, receive, and response-check counts all matched, with 0 errors. CPU usage counts one logical CPU as 100%.
 
-### gnet v2.10.0
+#### gnet v2.10.0
 
 | Client<br />message <br />size | Pipelined<br /> requests<br /> per client |     **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |         CPU / RSS |
 | -----------------------------: | ----------------------------------------: | ----------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
 |                    1,000 bytes |                                       100 | **530,792** |         **106,158** |              530.79 MB/s |               15,926,220 |           30.005 s | 502.5% / 11.50 MiB |
 |                    1,000 bytes |                                         1 | **311,798** |          **62,360** |              311.80 MB/s |                9,354,398 |           30.001 s | 503.4% / 14.56 MiB |
+
+### 65536-byte response
+
+After receiving data from a client, the test server sends a 65536-byte acknowledgment for each packet.
+
+#### erio
+
+| Client<br />message <br />size | Pipelined<br />requests<br /> per client |     **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |           CPU / RSS |
+| -----------------------------: | ---------------------------------------: | ----------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | ------------------: |
+|                    1,000 bytes |                                      100 | **123,300** |          **24,660** |              123.30 MB/s |                3,701,594 |           30.021 s | 501.9% / 266.00 MiB |
+|                    1,000 bytes |                                        1 | **143,270** |          **28,654** |              143.27 MB/s |                4,298,296 |           30.001 s |  501.7% / 21.25 MiB |
+
+> The high RSS(266.00MiB) at 1,000 bytes with 100 pipelined requests is because the per-session write buffer was set to 65536*100 instead of making use of OnWritten.
+
+#### gnet v2.10.0
+
+| Client<br />message <br />size | Pipelined<br /> requests<br /> per client |     **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |          CPU / RSS |
+| -----------------------------: | ----------------------------------------: | ----------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
+|                    1,000 bytes |                                       100 | **149,553** |          **29,911** |              149.55 MB/s |                4,489,290 |           30.018 s | 509.1% / 16.25 MiB |
+|                    1,000 bytes |                                         1 | **148,704** |          **29,741** |              148.70 MB/s |                4,461,289 |           30.001 s | 503.1% / 10.25 MiB |
 
 ## Quick Start
 
@@ -411,7 +433,10 @@ type ClientHandler interface {
 	//   - context: HandlerContext of the connection
 	//   - clientError: error that occurred
 	//
-	// If TCPReactor registration fails, only OnError is called, and OnConnect and OnClose are not called.
+	// If the TCPReactor fails while processing the registration, only OnError is called, and
+	// OnConnect and OnClose are not called.
+	// If TCPReactor.RegisterHandler returns an error, such as ErrTCPReactorStopped, no ClientHandler
+	// callback is called, and the error is passed to the callback set with WithAcceptErrorCallback.
 	OnError(context *HandlerContext, clientError error)
 
 	// OnClose is called when the connection is lost and detached from the Reactor.
@@ -445,14 +470,14 @@ type ClientHandler interface {
 
 ```Go
 // Creates a HandlerContext for a client TCP connection.
-func NewHandlerContext(handlerFD FileDescriptor, listenAddress netip.AddrPort,
+func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
 	writeBufferSize uint32, commandQuota uint32, soLingerSecs int) (*HandlerContext, error)
 
 // Reuses the existing buffers, commandQuota, and soLingerSecs, and reinitializes the object with the given connection information.
 // Does not allocate new buffers.
 // It is safe to call only before the handler is registered with the Reactor (before returning it
 // from ClientHandlerFactory) or as the last call in OnClose.
-func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddress netip.AddrPort) error
+func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.AddrPort) error
 
 // Clears all state except commandQuota and soLingerSecs, and sets handlerFD to -1.
 // Buffers keep their capacity. It does not close handlerFD, so call it after the connection is closed.
