@@ -1,4 +1,4 @@
-// erio echo server example: sends received data back and closes the connection if nothing is sent or received for 10 seconds.
+// erio echo server example: sends received data back and closes the connection if nothing is received for 10 seconds.
 package main
 
 import (
@@ -31,9 +31,10 @@ const ALIVE_TIMER_KEY uint64 = 10
 // Called each time the Acceptor accepts a connection.
 // See: client_handler.go::ClientHandlerFactory
 func EchoHandlerFactory(fd erio.FileDescriptor, listenAddr netip.AddrPort) (erio.ClientHandler, error) {
-	// Send buffer 64KiB, command quota 64.
+	// Send buffer 64KiB, command quota 64
+	// closePendingWriteTimeout 0 (Close sends all remaining data with no time limit, then closes the connection.)
 	// See: handler_context.go::NewHandlerContext
-	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64)
+	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +88,7 @@ func (this *EchoHandler) OnError(context *HandlerContext, clientError error) {
 }
 
 // Called once when the connection is removed.
-// closeReason: ErrTCPReactorReadHangup, ErrTCPReactorHangup, ErrTCPReactorStopped, etc.
+// closeReason: ErrTCPReactorCloseRequested, ErrTCPReactorHangup, ErrTCPReactorStopped, etc.
 func (this *EchoHandler) OnClose(context *HandlerContext, closeReason error) {
 	log.Printf("%s closed: %v", context.PeerAddrPort(), closeReason)
 	log.Printf("active clients: %d", context.Count())

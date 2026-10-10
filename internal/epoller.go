@@ -73,6 +73,10 @@ func (this *Epoller) UnregisterRead(fd FileDescriptor) error {
 	return this.changeInterest(fd, 0, syscall.EPOLLIN)
 }
 
+func (this *Epoller) UnregisterReadWithHangup(fd FileDescriptor) error {
+	return this.changeInterest(fd, 0, syscall.EPOLLIN|syscall.EPOLLRDHUP)
+}
+
 func (this *Epoller) RegisterWrite(fd FileDescriptor) error {
 	return this.changeInterest(fd, syscall.EPOLLOUT, 0)
 }

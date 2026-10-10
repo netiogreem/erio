@@ -48,10 +48,10 @@ func (this *TCPReactor) handleCommands() (isStop bool) {
 			this.handleCommandUser(command.handler, command.userEventData)
 
 		case commandClose:
-			this.removeHandler(command.handler, ErrTCPReactorReadHangup, false)
+			this.handleCommandClose(command.handler)
 
-		case commandAbort:
-			this.removeHandler(command.handler, ErrTCPReactorReadHangup, true)
+		case commandAbortiveClose:
+			this.handleCommandAbortiveClose(command.handler)
 
 		default:
 			this.handleError(ErrTCPReactorCommand)
@@ -134,6 +134,56 @@ func (this *TCPReactor) handleCommandWrite(handler ClientHandler) {
 	if err := this.epoller.RegisterWrite(handler.context().fileDescriptor()); err != nil {
 		handler.OnError(handler.context(), err)
 	}
+}
+
+// handleCommandClose stops receiving, sends the remaining data of the write buffer, and then
+// removes the handler.
+// If data remains after the send, it keeps write monitoring, and handleEventWritable removes the
+// handler when all data has been sent.
+// It also registers the expiration time of closePendingWriteTimeout with clientTimer, and
+// handleTimeouts closes the connection with RST if the data is not sent by then.
+// If AbortiveClose was requested after Close, it does nothing, and the following AbortiveClose
+// command closes the connection.
+// If registering write monitoring fails, it reports the error through OnError and removes the
+// handler without sending the remaining data.
+//
+//   - handler: target of the close, and the command is ignored if it differs from the currently
+//     registered object.
+func (this *TCPReactor) handleCommandClose(handler ClientHandler) {
+	if !handler.context().isClosing() {
+		return
+	}
+
+	fd := handler.context().fileDescriptor()
+
+	// Read monitoring is removed so that level-triggered EPOLLIN is not repeated while sending.
+	if err := this.epoller.UnregisterReadWithHangup(fd); err != nil {
+		this.handleError(err)
+	}
+
+	if handler.context().onWritable() == false {
+		this.removeHandler(handler, ErrTCPReactorCloseRequested, false)
+		return
+	}
+
+	if err := this.epoller.RegisterWrite(fd); err != nil {
+		handler.OnError(handler.context(), err)
+		this.removeHandler(handler, ErrTCPReactorCloseRequested, false)
+		return
+	}
+
+	// In the Closing state, nextExpiration includes the expiration time of closePendingWriteTimeout.
+	nextExpiration, hasTimer := handler.context().nextExpiration()
+	this.updateClientTimer(handler, nextExpiration, hasTimer)
+}
+
+// handleCommandAbortiveClose closes the connection with RST and removes the handler.
+// Data not yet delivered to the peer is discarded.
+//
+//   - handler: target of the abortive close, and the command is ignored if it differs from the currently
+//     registered object.
+func (this *TCPReactor) handleCommandAbortiveClose(handler ClientHandler) {
+	this.removeHandler(handler, ErrTCPReactorAbortiveCloseRequested, true)
 }
 
 // handleCommandUser calls the handler's OnUserEvent with the data delivered through PostUserEvent.

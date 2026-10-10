@@ -38,7 +38,9 @@ const (
 	ErrTCPReactorNilHandlerCounter           TCPReactorError = "erio: tcp reactor handler counter is nil"
 	ErrTCPReactorDuplicateFD                 TCPReactorError = "erio: tcp reactor file descriptor is already registered"
 	ErrTCPReactorHangup                      TCPReactorError = "erio: client connection is closed"
-	ErrTCPReactorReadHangup                  TCPReactorError = "erio: client read side is closed"
+	ErrTCPReactorCloseRequested              TCPReactorError = "erio: connection closed by Close"
+	ErrTCPReactorAbortiveCloseRequested      TCPReactorError = "erio: connection closed by AbortiveClose"
+	ErrTCPReactorClosePendingWriteTimeout    TCPReactorError = "erio: pending write data was not sent within the timeout after Close"
 	ErrTCPReactorStopped                     TCPReactorError = "erio: tcp reactor is stopped"
 	ErrTCPReactorStateNotInit                TCPReactorError = "erio: tcp reactor is not in the Init state"
 	ErrTCPReactorStateNotStart               TCPReactorError = "erio: tcp reactor is not in the Start state"
@@ -445,12 +447,21 @@ func (this *TCPReactor) HandlerCount() uint32 {
 
 // handleTimeouts processes expired timers and updates the next expiration time of each Handler.
 // If there are expired timers, Writes requested in OnTimeout are processed as immediate writes.
+// A Handler whose remaining Write data after Close has expired is removed with RST instead of
+// calling OnTimeout.
 //
 // It is the epoll wait time, -1 if there is no timer, with an upper limit of MaxInt32 milliseconds.
 func (this *TCPReactor) handleTimeouts() time.Duration {
 	if expired := this.clientTimer.PopExpired(); len(expired) > 0 {
 		this.commands.BeginImmediateWrites()
 		for _, handler := range expired {
+			// If the remaining Write data was not sent within closePendingWriteTimeout after Close,
+			// the connection is closed with RST.
+			if handler.context().isClosePendingWriteExpired() {
+				this.removeHandler(handler, ErrTCPReactorClosePendingWriteTimeout, true)
+				continue
+			}
+
 			nextExpiration, hasTimer := handler.context().onTimeout()
 			this.updateClientTimer(handler, nextExpiration, hasTimer)
 		}

@@ -51,12 +51,25 @@ type ClientHandler interface {
 	//   - timerKey: key of the expired timer
 	OnTimeout(context *HandlerContext, timerKey uint64)
 
+	// OnReadClosed is called when the peer closes its sending side (half-close).
+	// The connection can still send, and no more data is received.
+	// HandlerContext provides a default implementation that calls Close, so the connection is
+	// closed after the remaining data is sent.
+	// To keep the connection and continue sending, implement this method and call Close when
+	// sending is finished.
+	//
+	//   - context: HandlerContext of the connection
+	OnReadClosed(context *HandlerContext)
+
 	// OnError is called when an error occurs while handling an event.
 	//
 	//   - context: HandlerContext of the connection
 	//   - clientError: error that occurred
 	//
 	// If TCPReactor registration fails, only OnError is called, and OnConnect and OnClose are not called.
+	// Send and receive errors do not close the connection. If the connection is lost, it is cleaned
+	// up with OnClose(ErrTCPReactorHangup). To close the connection after checking the error, call
+	// Close or AbortiveClose.
 	OnError(context *HandlerContext, clientError error)
 
 	// OnClose is called when the connection is lost and detached from the Reactor.
@@ -64,10 +77,16 @@ type ClientHandler interface {
 	//   - context: HandlerContext of the connection
 	//   - closeReason: reason the connection was closed
 	//
-	// closeReason is ErrTCPReactorHangup if the connection is lost, ErrTCPReactorReadHangup if the
-	// peer closes its sending side or TCPReactor processes a close request from
-	// HandlerContext.Close or HandlerContext.Abort, and ErrTCPReactorStopped if TCPReactor is
-	// stopped.
+	// closeReason is the situation at the time the connection is closed.
+	//   - ErrTCPReactorCloseRequested: Close closed the connection, including Close called by the
+	//     default OnReadClosed. The remaining data is sent before closing, but if registering
+	//     write monitoring fails, OnError is called and the connection is closed without sending
+	//     the remaining data.
+	//   - ErrTCPReactorAbortiveCloseRequested: AbortiveClose closed the connection with RST.
+	//   - ErrTCPReactorClosePendingWriteTimeout: the remaining data was not sent within
+	//     closePendingWriteTimeout after Close, and the connection was closed with RST.
+	//   - ErrTCPReactorHangup: the connection was lost.
+	//   - ErrTCPReactorStopped: TCPReactor was stopped.
 	OnClose(context *HandlerContext, closeReason error)
 
 	// GetCommandQuota returns the command limit.
