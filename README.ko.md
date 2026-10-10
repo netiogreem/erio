@@ -313,6 +313,7 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
 * WithClientHandlerFactory
   * ClientHandler 인터페이스의 구현체를 반환하는 Factory 함수를 등록합니다.
   * Factory함수 형식: func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
+  * Factory함수는 ClientHandler를 항상 포인터(예: &MyHandler{...})로 반환해야 합니다. 값으로 반환하면 연결이 거절됩니다.
   * 클라이언트가 접속하면 Acceptor는 Factory함수를 호출하고 Reactor와 연결됩니다.
 
 ```go
@@ -391,6 +392,9 @@ type FileDescriptor = internal.FileDescriptor
 // ClientHandlerFactory는 Acceptor가 수락한 연결마다 호출하는 ClientHandler 생성 함수입니다.
 // fd는 연결된 FileDescriptor이고, listenAddress는 연결을 수락한 리스닝 주소입니다.
 // 오류를 반환하거나 nil Handler를 반환하면 Acceptor가 연결을 거절합니다.
+// 반환하는 ClientHandler는 항상 포인터(예: &MyHandler{...})여야 합니다.
+// 포인터가 아니면 TCPReactor.RegisterHandler가 ErrTCPReactorNonPointerHandler로 거절하고,
+// Acceptor가 연결을 닫습니다.
 type ClientHandlerFactory func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
 
 // ClientHandler는 TCPReactor에서 클라이언트 이벤트를 처리하는 사용자용 콜백 인터페이스입니다.
@@ -587,5 +591,3 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
 * **Close는 남은 데이터를 다 보낸 뒤 닫습니다.**
   * Close()는 닫힌 상태를 기록하고 Reactor에 연결 종료를 요청합니다. Reactor는 HandlerContext 송신 버퍼에 남은 데이터를 보낸 뒤 FIN으로 닫고, ClientHandler.OnClose를 호출하여 줍니다.
   * 상대방이 데이터를 받지 않으면 연결이 남습니다. NewHandlerContext의 closePendingWriteTimeout을 설정하거나 AbortiveClose()를 호출하세요.
-* **상대방이 송신 측을 닫으면(half-close) 기본 동작은 연결을 닫는 것입니다.**
-  * 기본 OnReadClosed가 Close()를 호출하므로, 남은 데이터를 보낸 뒤 연결이 닫힙니다.

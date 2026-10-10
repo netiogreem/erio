@@ -5,6 +5,7 @@ import (
 	"github.com/netiogreem/erio/internal"
 	"math"
 	"os"
+	"reflect"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ const (
 	ErrTCPReactorInvalidFileDescriptor       TCPReactorError = "erio: invalid tcp reactor handler file descriptor"
 	ErrTCPReactorCommand                     TCPReactorError = "erio: invalid tcp reactor command"
 	ErrTCPReactorNilHandler                  TCPReactorError = "erio: tcp reactor handler is nil"
+	ErrTCPReactorNonPointerHandler           TCPReactorError = "erio: tcp reactor handler must be a pointer"
 	ErrTCPReactorNilHandlerContext           TCPReactorError = "erio: tcp reactor handler context is nil"
 	ErrTCPReactorNilHandlerCounter           TCPReactorError = "erio: tcp reactor handler counter is nil"
 	ErrTCPReactorDuplicateFD                 TCPReactorError = "erio: tcp reactor file descriptor is already registered"
@@ -395,7 +397,8 @@ func (this *TCPReactor) WaitStop() error {
 // It returns an error if enqueuing fails, and after enqueuing, the registration result is delivered
 // through Handler callbacks.
 // It returns ErrTCPReactorUninitialized if it was not created with NewTCPReactor,
-// ErrTCPReactorNilHandler if handler is nil,
+// ErrTCPReactorNilHandler if handler is nil or a nil pointer,
+// ErrTCPReactorNonPointerHandler if handler is not a pointer,
 // ErrTCPReactorNilHandlerContext if HandlerContext is nil, ErrHandlerContextAlreadyBound if the
 // Handler is already registered,
 // ErrTCPReactorInvalidFileDescriptor if the FD is negative, and ErrTCPReactorStopped if it is not
@@ -408,6 +411,16 @@ func (this *TCPReactor) RegisterHandler(handler ClientHandler) error {
 	}
 
 	if handler == nil {
+		return ErrTCPReactorNilHandler
+	}
+
+	// A Handler is used as a map key and compared by identity, so only pointers are accepted.
+	value := reflect.ValueOf(handler)
+	if value.Kind() != reflect.Pointer {
+		return ErrTCPReactorNonPointerHandler
+	}
+
+	if value.IsNil() {
 		return ErrTCPReactorNilHandler
 	}
 

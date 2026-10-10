@@ -313,6 +313,7 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
 * WithClientHandlerFactory
   * Registers a Factory function that returns an implementation of the ClientHandler interface.
     * Factory function signature: func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
+    * The Factory function must always return the ClientHandler as a pointer (e.g., &MyHandler{...}). If it returns a value, the connection is rejected.
   * When a client connects, the Acceptor calls the Factory function, and the connection is attached to a Reactor.
 
 ```go
@@ -392,6 +393,9 @@ type FileDescriptor = internal.FileDescriptor
 // ClientHandlerFactory is the ClientHandler factory function that Acceptor calls for each accepted connection.
 // fd is the FileDescriptor of the connection, and listenAddress is the listen address that accepted the connection.
 // If it returns an error or a nil Handler, Acceptor rejects the connection.
+// The returned ClientHandler must always be a pointer (e.g., &MyHandler{...}).
+// If it is not a pointer, TCPReactor.RegisterHandler rejects it with
+// ErrTCPReactorNonPointerHandler, and Acceptor closes the connection.
 type ClientHandlerFactory func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
 
 // ClientHandler is the user-facing callback interface for handling client events in a TCPReactor.
@@ -593,5 +597,3 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
 * **Close closes the connection after the remaining data is sent.**
   * Close() records the closed state and submits a close request to the Reactor. The Reactor sends the data remaining in the HandlerContext send buffer, closes the connection with FIN, and then calls ClientHandler.OnClose().
   * If the peer does not receive the data, the connection stays open. Set closePendingWriteTimeout of NewHandlerContext, or call AbortiveClose().
-* **By default, the connection is closed when the peer closes its sending side (half-close).**
-  * The default OnReadClosed calls Close(), so the connection is closed after the remaining data is sent.

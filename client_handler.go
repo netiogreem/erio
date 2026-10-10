@@ -12,6 +12,9 @@ type FileDescriptor = internal.FileDescriptor
 // ClientHandlerFactory is the ClientHandler factory function that Acceptor calls for each accepted connection.
 // fd is the FileDescriptor of the connection, and listenAddress is the listen address that accepted the connection.
 // If it returns an error or a nil Handler, Acceptor rejects the connection.
+// The returned ClientHandler must always be a pointer (e.g., &MyHandler{...}).
+// If it is not a pointer, TCPReactor.RegisterHandler rejects it with
+// ErrTCPReactorNonPointerHandler, and Acceptor closes the connection.
 type ClientHandlerFactory func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
 
 // ClientHandler is the user-facing callback interface for handling client events in a TCPReactor.
