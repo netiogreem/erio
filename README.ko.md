@@ -92,7 +92,7 @@ erio와 gnet 모두 공개 API를 사용하며 수신된 패킷별로 하나의 
 
 ## 빠른 시작
 
-> 아래 코드는 examples/echo_server/main.go와 같습니다. 새 서버를 만들 때 템플릿으로 활용하실 수 있습니다.
+> 새 서버를 만들 때 템플릿으로 활용하실 수 있습니다. 아래 코드는 examples/echo_server/main.go와 같습니다.
 
 erio는 **On{Event}(onComplete func(...)) 패턴**의 **콜백에만 의존하는 구현 방식을 지양**합니다.
 

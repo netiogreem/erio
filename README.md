@@ -90,7 +90,7 @@ After receiving data from a client, the test server sends a 65536-byte acknowled
 
 ## Quick Start
 
-> The code below is the same as examples/echo_server/main.go. You can use it as a template when building your own server.
+> You can use it as a template when building your own server. The code below is the same as examples/echo_server/main.go.
 
 erio **avoids implementation approaches that depend only on callbacks, such as the On{Event}(**onComplete func(...)**) pattern**.
 
