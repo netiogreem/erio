@@ -575,7 +575,7 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
 ## 주의 사항
 
 * **이벤트 콜백에서 오래 대기하지 마세요.**
-  * 같은 Reactor에 배정된 ClientHandler 세션들은 하나의 고루틴에서 처리됩니다. 콜백 안에서 긴 연산, 동기 DB 조회, time.Sleep, 무한 재시도를 수행하면 해당 Reactor의 다른 세션도 처리가 지연됩니다. Long Transaction은 별개로 설계해야 합니다.
+  * 같은 Reactor에 배정된 ClientHandler 세션들은 하나의 고루틴에서 처리됩니다. 콜백 안에서 긴 연산, time.Sleep, 무한 재시도를 수행하면 해당 Reactor의 다른 세션도 처리가 지연됩니다. Long Transaction은 별개로 설계해야 합니다.
 * **ClientHandler는 외부 고루틴에서 사용하지 마세요.**
   * ClientHandler는 외부 고루틴에 의해 호출되는 것을 보호하지 않습니다. 외부 고루틴에서는 HandlerContext가 제공하는 제어 메서드를 사용하세요.
 * **HandlerContext의 Init() Reset()은 thread-safe가 아닙니다.**
@@ -589,4 +589,3 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
   * 상대방이 데이터를 받지 않으면 연결이 남습니다. NewHandlerContext의 closePendingWriteTimeout을 설정하거나 AbortiveClose()를 호출하세요.
 * **상대방이 송신 측을 닫으면(half-close) 기본 동작은 연결을 닫는 것입니다.**
   * 기본 OnReadClosed가 Close()를 호출하므로, 남은 데이터를 보낸 뒤 연결이 닫힙니다.
-  * 상대방의 half-close 후에도 계속 송신하려면 Handler에 OnReadClosed를 구현하고, 송신이 끝나면 Close()를 호출하세요.

@@ -2,9 +2,10 @@ package erio
 
 import (
 	"fmt"
-	"github.com/netiogreem/erio/internal"
 	"os"
 	"syscall"
+
+	"github.com/netiogreem/erio/internal"
 )
 
 // handleEvent processes the epoll events of a registered Handler in the order of read, write,
@@ -33,7 +34,12 @@ func (this *TCPReactor) handleEvent(fd internal.FileDescriptor, event syscall.Ep
 	}
 
 	if event.Events&syscall.EPOLLOUT != 0 {
-		if removed := this.handleEventWritable(handler, isClosed); removed {
+		hasRemaining := this.handleEventWritable(handler, isClosed)
+
+		// Close sends the remaining data before closing so that a response written after the peer's
+		// half-close is not discarded, and the handler is removed once all remaining data is sent.
+		if hasRemaining == false && handler.context().isClosing() {
+			this.removeHandler(handler, ErrTCPReactorCloseRequested, false)
 			return
 		}
 	}
@@ -65,22 +71,15 @@ func (this *TCPReactor) handleEventReadable(handler ClientHandler, readAll bool)
 // If data remains to be sent while handling a write event, it keeps the
 // write event (EPOLLOUT) registered so that the next write event is received.
 // If no data remains to be sent, it removes the write event.
-// If Close was requested and all remaining data has been sent, it removes the ClientHandler.
 //
 //   - handler: ClientHandler on which the write event occurred.
 //   - isClosed: true if a close event was delivered together.
 //
-// removed is true if the ClientHandler was removed, and the remaining events must not be processed.
-func (this *TCPReactor) handleEventWritable(handler ClientHandler, isClosed bool) (removed bool) {
+// hasRemaining is true if unsent data remains and write monitoring is kept, and false if no data
+// remains or isClosed is true.
+func (this *TCPReactor) handleEventWritable(handler ClientHandler, isClosed bool) (hasRemaining bool) {
 	// If unsent data remains, monitoring is kept so that the next write event is received.
 	if isClosed == false && handler.context().onWritable() {
-		return false
-	}
-
-	// Close sends the remaining data before closing so that a response written after the peer's
-	// half-close is not discarded, and the handler is removed once all remaining data is sent.
-	if handler.context().isClosing() {
-		this.removeHandler(handler, ErrTCPReactorCloseRequested, false)
 		return true
 	}
 

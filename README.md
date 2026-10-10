@@ -581,7 +581,7 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
 ## Caveats
 
 * **Do not block for long in event callbacks.**
-  * ClientHandler sessions assigned to the same Reactor are processed on a single goroutine. Long computations, synchronous DB queries, time.Sleep, or infinite retries inside a callback delay the processing of other sessions on that Reactor. Long transactions must be designed separately.
+  * ClientHandler sessions assigned to the same Reactor are processed on a single goroutine. Long computations, time.Sleep, or infinite retries inside a callback delay the processing of other sessions on that Reactor. Long transactions must be designed separately.
 * **Do not use ClientHandler from other goroutines.**
   * ClientHandler is not safe to call from other goroutines. From other goroutines, use the control methods provided by HandlerContext.
 * **Init() and Reset() on HandlerContext are not thread-safe.**
@@ -595,4 +595,3 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
   * If the peer does not receive the data, the connection stays open. Set closePendingWriteTimeout of NewHandlerContext, or call AbortiveClose().
 * **By default, the connection is closed when the peer closes its sending side (half-close).**
   * The default OnReadClosed calls Close(), so the connection is closed after the remaining data is sent.
-  * To keep sending after the peer's half-close, implement OnReadClosed in the handler and call Close() when sending is finished.
