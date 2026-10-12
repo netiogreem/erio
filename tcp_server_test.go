@@ -7,6 +7,7 @@ import (
 	"slices"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/netiogreem/erio"
 )
@@ -29,7 +30,7 @@ func newTCPServerTest(test testing.TB, listenAddresses ...string) (*erio.TCPServ
 	test.Helper()
 	events := &handlerContextFixture{events: make(chan handlerContextTestEvent, 16)}
 	factory := func(fd erio.FileDescriptor, listenAddress netip.AddrPort) (erio.ClientHandler, error) {
-		context, createError := erio.NewHandlerContext(fd, listenAddress, 64, 8)
+		context, createError := erio.NewHandlerContext(fd, listenAddress, 32*1024, 64, 5*time.Second)
 		if createError != nil {
 			return nil, createError
 		}

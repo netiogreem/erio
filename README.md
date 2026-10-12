@@ -4,7 +4,7 @@ Epoll Reactor-based TCP I/O framework
 
 ## Introduction
 
-erio is a framework designed for the **invariance of session connection state** and the **serialized processing of session events, guaranteeing** that each session is always processed on the same goroutine.
+erio is a framework designed for the **invariance of session connection state** and the **serialized processing of session events**, guaranteeing that each session is always processed on the same goroutine.
 
 It implements the Reactor pattern with Linux epoll for I/O multiplexing and runs in an event-driven manner without creating a goroutine per connection.
 
@@ -23,7 +23,7 @@ erio is a good fit for the following use cases:
 ## Key Features
 
 * **Serialized processing of session events**
-  * Connection, receive, write/write-completion, multi-timer, and close events are processed serially on the same Reactor goroutine, so event callbacks of the same session never run concurrently.
+  * Connection, receive, read close (peer half-close), write/write-completion, multi-timer, and close events are processed serially on the same Reactor goroutine, so event callbacks of the same session never run concurrently.
 * **Multiple listen addresses and connection distribution**
   * You can register multiple addresses and ports, and assign accepted connections to multiple Reactors in round-robin order.
 * **Multi-session handling without per-connection goroutines**
@@ -33,7 +33,7 @@ erio is a good fit for the following use cases:
 * **Multiple timers per session**
   * On the same goroutine that handles session events, you can use timer keys with SetTimeout(timerKey, timeout) and OnTimeout(timerKey) to manage response wait times, idle-connection timeouts, and authentication time limits separately.
 * **Session control from other goroutines**
-  * HandlerContext's Write, SetTimeout, UnsetTimeout, Close, Abort, and PostUserEvent can be called from other goroutines without any extra work (such as synchronization).
+  * HandlerContext's Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, and PostUserEvent can be called from other goroutines without any extra work (such as synchronization).
 * **Asynchronous delivery of user data to a target session**
   * User-defined data can be sent asynchronously from another goroutine to any session and received in that session on the goroutine the session runs on.
 
@@ -90,8 +90,6 @@ After receiving data from a client, the test server sends a 65536-byte acknowled
 
 ## Quick Start
 
-> The code below is the same as examples/echo_server/main.go. You can use it as a template when building your own server.
-
 erio **avoids implementation approaches that depend only on callbacks, such as the On{Event}(**onComplete func(...)**) pattern**.
 
 Instead, it is designed so that users implement the interface's event callbacks themselves, and effort has gone into making the design hard to **misuse**.
@@ -100,9 +98,12 @@ Instead, it is designed so that users implement the interface's event callbacks 
 >
 > Therefore, unlike other frameworks, erio does not provide **default/empty method implementations or methods that take a callback function per event as an argument**.
 >
-> - OnUserEvent and OnTimeout are exceptions, as they are optional for the user.
+> - OnUserEvent, OnTimeout, and OnReadClose are exceptions, because whether to use them is the user's choice. OnUserEvent and OnTimeout do nothing by default, and OnReadClose calls Close by default.
 
 ### Echo Server Example
+
+> You can use it as a template when building your own server.
+> The code below is the same as examples/echo_server/main.go.
 
 The following is a TCP echo server that sends received data back as is.
 
@@ -142,9 +143,9 @@ const ALIVE_TIMER_KEY uint64 = 10
 // Called each time the Acceptor accepts a connection.
 // See: client_handler.go::ClientHandlerFactory
 func EchoHandlerFactory(fd erio.FileDescriptor, listenAddr netip.AddrPort) (erio.ClientHandler, error) {
-	// Send buffer 64KiB, command quota 64.
+	// Send buffer 64KiB, command quota 64, abortiveCloseTimeout 0 (Close waits until all data is sent).
 	// See: handler_context.go::NewHandlerContext
-	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64)
+	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +199,7 @@ func (this *EchoHandler) OnError(context *HandlerContext, clientError error) {
 }
 
 // Called once when the connection is removed.
-// closeReason: ErrTCPReactorReadHangup, ErrTCPReactorHangup, ErrTCPReactorStopped, etc.
+// closeReason: ErrTCPReactorCloseRequested, ErrTCPReactorAbortiveClose, ErrTCPReactorAbortiveCloseTimeout, ErrTCPReactorHangup, or ErrTCPReactorStopped.
 func (this *EchoHandler) OnClose(context *HandlerContext, closeReason error) {
 	log.Printf("%s closed: %v", context.PeerAddrPort(), closeReason)
 	log.Printf("active clients: %d", context.Count())
@@ -242,7 +243,7 @@ func main() {
 }
 ```
 
-Save the code above to erio/examples/echo_server/main.go and run it from the erio/ directory.
+Run it from the erio/ directory.
 
 ```bash
 go run ./examples/echo_server
@@ -307,8 +308,12 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
     * ReadBufferSize: The receive buffer size of each Reactor.
     * ErrorCallback: Reactor error callback
 * WithListenAddress(listenAddress string)
-  * Registers a listen address. (e.g., 172.30.10.10:30010)
+  * Registers a listen address in "IP:port" format. (e.g., 172.30.10.10:30010)
+  * Host names are not resolved and are rejected by Build.
   * Call it again to add more listen addresses.
+* WithAcceptErrorCallback
+  * Sets the callback for errors that occur while accepting connections, creating Handlers, or requesting Reactor registration.
+  * The callback is invoked in each Acceptor's accept loop goroutine.
 * WithClientHandlerFactory
   * Registers a Factory function that returns an implementation of the ClientHandler interface.
     * Factory function signature: func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
@@ -349,7 +354,7 @@ func (this *Builder) Build() (server *TCPServer, err error)
 * Created by Builder.Build(), it manages accepting connections and starting and stopping the Reactors.
 * Start() starts all Reactors and then starts listening.
 * Stop() stops accepting new connections, stops all Reactors, waits for them to finish, and releases their epoll and eventfd resources. It returns nil regardless of the stop results.
-* Listen address indexes start at 0 in registration order. If you specified port 0, you can query the port actually assigned after Start() succeeds.
+* If you specified port 0, you can query the port actually assigned after Start() succeeds.
 
 ```go
 // Starts all Reactors and listeners.
@@ -369,7 +374,7 @@ func (this *TCPServer) ListenAddrPorts() []netip.AddrPort
 
 All ClientHandler callbacks are called on the same goroutine, which keeps session events serialized.
 
-Because erio **avoids implementation approaches that rely solely on callbacks, such as the On{Event}(completion callback function) pattern**, it does not provide **default/empty implementations or per-event callback functions**, except for OnUserEvent and OnTimeout, which are optional for users.
+Because erio **avoids implementation approaches that rely solely on callbacks, such as the On{Event}(completion callback function) pattern**, it does not provide **default/empty implementations or per-event callback functions**, except for OnUserEvent, OnTimeout, and OnReadClose, because whether to use them is the user's choice. OnUserEvent and OnTimeout do nothing by default, and OnReadClose calls Close by default.
 
 * Users must implement the ClientHandler interface. A ClientHandler is created for each connection.
 * ClientHandler must not be used from other goroutines.
@@ -390,7 +395,7 @@ type FileDescriptor = internal.FileDescriptor
 
 // ClientHandlerFactory is the ClientHandler factory function that Acceptor calls for each accepted connection.
 // fd is the FileDescriptor of the connection, and listenAddress is the listen address that accepted the connection.
-// If it returns an error or a nil Handler, Acceptor rejects the connection.
+// If it returns an error, a nil Handler, or a typed nil Handler, Acceptor rejects the connection.
 type ClientHandlerFactory func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
 
 // ClientHandler is the user-facing callback interface for handling client events in a TCPReactor.
@@ -425,6 +430,7 @@ type ClientHandler interface {
 	OnUserEvent(context *HandlerContext, userEventData any)
 
 	// OnTimeout is called when a timer expires.
+	// It is optional for the user; HandlerContext provides an empty implementation.
 	//
 	//   - context: HandlerContext of the connection
 	//   - timerKey: key of the expired timer
@@ -435,20 +441,28 @@ type ClientHandler interface {
 	//   - context: HandlerContext of the connection
 	//   - clientError: error that occurred
 	//
-	// If the TCPReactor fails while processing the registration, only OnError is called, and
-	// OnConnect and OnClose are not called.
-	// If TCPReactor.RegisterHandler returns an error, such as ErrTCPReactorStopped, no ClientHandler
-	// callback is called, and the error is passed to the callback set with WithAcceptErrorCallback.
+	// If TCPReactor registration fails, only OnError is called, and OnConnect and OnClose are not called.
+	// If TCPReactor.RegisterHandler itself returns an error, no ClientHandler callback is called, and
+	// the error is passed to the callback set with WithAcceptErrorCallback.
 	OnError(context *HandlerContext, clientError error)
 
-	// OnClose is called when the connection is lost and detached from the Reactor.
+	// OnReadClose is called once when the peer's FIN arrives, after all data received before the FIN
+	// has been passed to OnRead. It is also called when the peer closed the whole connection, because
+	// a FIN alone cannot tell the two apart.
+	// Write is still available. HandlerContext provides the default implementation that calls Close.
+	//
+	//   - context: HandlerContext of the connection
+	OnReadClose(context *HandlerContext)
+
+	// OnClose is called once when the connection is closed and detached from the Reactor.
 	//
 	//   - context: HandlerContext of the connection
 	//   - closeReason: reason the connection was closed
 	//
-	// closeReason is ErrTCPReactorHangup if the connection is lost, ErrTCPReactorReadHangup if the
-	// peer closes its sending side or a Close or Abort request is processed,
-	// and ErrTCPReactorStopped if TCPReactor is stopped.
+	// closeReason is ErrTCPReactorCloseRequested if Close completes, ErrTCPReactorAbortiveClose if
+	// AbortiveClose is processed, ErrTCPReactorAbortiveCloseTimeout if the pending write data is not
+	// sent within abortiveCloseTimeout after Close, ErrTCPReactorHangup if the connection is lost, and
+	// ErrTCPReactorStopped if TCPReactor is stopped.
 	OnClose(context *HandlerContext, closeReason error)
 
 	// GetCommandQuota returns the command limit.
@@ -468,20 +482,22 @@ type ClientHandler interface {
 
 * Must be embedded in a ClientHandler.
 * HandlerContext is the type that controls a ClientHandler, and its methods, except Init() and Reset(), are thread-safe and can also be used from other goroutines.
-* Calls to HandlerContext's command methods (Write, SetTimeout, UnsetTimeout, Close, Abort, PostUserEvent) are asynchronous requests to the TCPReactor for serialized event processing; the TCPReactor processes them and calls the corresponding ClientHandler functions.
+* Calls to HandlerContext's command methods (Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent) are asynchronous requests to the TCPReactor for serialized event processing; the TCPReactor processes them and calls the corresponding ClientHandler functions.
 
 ```Go
 // Creates a HandlerContext for a client TCP connection.
+// abortiveCloseTimeout is the time to wait for the pending write data to be sent after Close is called.
+// If the data is not sent within this time, the connection is closed with RST. 0 waits until all data is sent.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
-	writeBufferSize uint32, commandQuota uint32) (*HandlerContext, error)
+	writeBufferSize uint32, commandQuota uint32, abortiveCloseTimeout time.Duration) (*HandlerContext, error)
 
-// Reuses the existing buffers and commandQuota, and reinitializes the object with the given connection information.
+// Reuses the existing buffers, commandQuota, and abortiveCloseTimeout, and reinitializes the object with the given connection information.
 // Does not allocate new buffers.
 // It is safe to call only before the handler is registered with the Reactor (before returning it
 // from ClientHandlerFactory) or as the last call in OnClose.
 func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.AddrPort) error
 
-// Clears all state except commandQuota, and sets handlerFD to -1.
+// Clears all state except commandQuota and abortiveCloseTimeout, and sets handlerFD to -1.
 // Buffers keep their capacity. It does not close handlerFD, so call it after the connection is closed.
 // It is safe to call only before the handler is registered with the Reactor (before returning it
 // from ClientHandlerFactory) or as the last call in OnClose.
@@ -513,15 +529,30 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error
 func (this *HandlerContext) PostUserEvent(userEventData any) error
 
 // Records the closed state first and requests a normal close of the connection.
+// The connection is closed after the data passed to Write is sent.
+// If the data is not sent within abortiveCloseTimeout, the connection is closed with RST.
 // If received data remains unread, the peer receives RST instead of FIN.
 func (this *HandlerContext) Close() error
 
 // Records the closed state first and requests a forced close (RST) of the connection.
+// It can also be requested while Close is waiting for the pending write data to be sent.
 // Data not yet delivered to the peer is discarded, including data already reported by OnWritten.
-func (this *HandlerContext) Abort() error
+func (this *HandlerContext) AbortiveClose() error
 
-// Reports whether the session is closed.
+// Default implementation of ClientHandler.OnReadClose. It requests Close.
+func (this *HandlerContext) OnReadClose(context *HandlerContext)
+
+// Reports whether the session is closed or a close is requested.
 func (this *HandlerContext) IsClosed() bool
+
+// Reports whether the session is usable.
+func (this *HandlerContext) IsOpen() bool
+
+// Reports whether AbortiveClose was requested.
+func (this *HandlerContext) IsAbortiveClosed() bool
+
+// Returns the size of the data passed to Write that has not yet been written to the socket.
+func (this *HandlerContext) UnwrittenSize() uint64
 ```
 
 It can be used as follows.
@@ -561,5 +592,7 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
   * receivedData in OnRead is a reused internal buffer. Copy it if you keep it after the callback or pass it to another goroutine. Write, on the other hand, copies the data into an internal buffer, so you can reuse the original buffer after it returns.
 * **OnWritten does not mean the peer has received the data.**
   * It means the data has been fully handed over to the local kernel. To confirm the peer's receipt or the completion of application-level processing, you need a protocol-level response.
-* **Close does not guarantee that remaining data is sent.**
-  * Close() records the closed state and submits a close request to the Reactor; the actual connection cleanup is done by the Reactor. Data in the HandlerContext send buffer that has not been written to the socket is discarded. Once the cleanup is complete, the Reactor calls ClientHandler.OnClose().
+* **Close sends the remaining data before closing.**
+  * Close() records the closed state and submits a close request to the Reactor. The Reactor writes all data in the HandlerContext send buffer to the socket and then closes the connection. Once the cleanup is complete, the Reactor calls ClientHandler.OnClose().
+* **With abortiveCloseTimeout 0, Close waits as long as the peer does not read.**
+  * If the peer stops reading, the remaining data cannot be sent and the connection stays open. If the connection must be closed, set abortiveCloseTimeout to close it automatically, or call AbortiveClose.

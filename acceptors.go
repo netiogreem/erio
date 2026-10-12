@@ -101,8 +101,7 @@ func NewAcceptors(acceptors ...*Acceptor) (*Acceptors, error) {
 // If any of them fails to start, it stops the Acceptors started before it and returns to Stop.
 //
 // It returns ErrAcceptorsUninitialized if not initialized, ErrAcceptorsStateNotStop if not in the
-// Stop state,
-// and the start error joined with the stop errors if starting fails.
+// Stop state, and the start error joined with the stop errors if starting fails.
 func (this *Acceptors) Start() error {
 	if err := this.beginTransition(AcceptorsStateStop, AcceptorsStateWaitRun, ErrAcceptorsStateNotStop); err != nil {
 		return err
@@ -130,8 +129,7 @@ func (this *Acceptors) Start() error {
 // transitions to Stop.
 //
 // It returns ErrAcceptorsUninitialized if not initialized, ErrAcceptorsStateNotRun if not in the
-// Run state,
-// and the individual stop errors joined together.
+// Run state, and the individual stop errors joined together.
 func (this *Acceptors) Stop() error {
 	if err := this.beginTransition(AcceptorsStateRun, AcceptorsStateWaitStop, ErrAcceptorsStateNotRun); err != nil {
 		return err

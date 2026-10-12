@@ -3,11 +3,12 @@ package erio
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/netiogreem/erio/internal"
 	"os"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/netiogreem/erio/internal"
 )
 
 // commandType represents the type of a command delivered by commandMailbox.
@@ -19,9 +20,10 @@ const (
 	commandUnsetTimeout
 	commandWrite
 	commandRegisterHandler
+	commandUnregisterHandler
 	commandUser
-	commandClose // Normal connection close command
-	commandAbort // Forced (RST) connection close command
+	commandClose         // Normal connection close command
+	commandAbortiveClose // Forced (RST) connection close command
 )
 
 // commandMailboxError represents an error returned by commandMailbox.
@@ -44,6 +46,7 @@ const (
 	ErrCommandMailboxRegisterQuotaExceeded       commandMailboxError = "erio: register command quota exceeded"
 	ErrCommandMailboxHandlerQuotaExceeded        commandMailboxError = "erio: handler command quota exceeded"
 	ErrCommandMailboxNilHandler                  commandMailboxError = "erio: handler is nil"
+	ErrCommandMailboxNotRegistered               commandMailboxError = "erio: handler is not registered in command mailbox"
 	ErrCommandMailboxInvalidCommand              commandMailboxError = "erio: invalid command"
 )
 
@@ -51,25 +54,35 @@ const (
 type command struct {
 	commandType   commandType   // Command type.
 	handler       ClientHandler // ClientHandler that processes the command.
+	reason        error         // Close reason to pass to OnClose for commandUnregisterHandler.
+	soLinger      bool          // If true, commandUnregisterHandler closes the connection with RST.
 	timerKey      uint64        // Key that identifies the timer.
-	expiresAt     time.Time     // Timer expiration time.
+	expiresAt     time.Time     // Timer expiration time, or the abortive close deadline for commandClose.
 	userEventData any           // User event data.
+}
+
+// handlerCommandCount holds the pending command count of a Handler and the generation in which it
+// was recorded.
+type handlerCommandCount struct {
+	generation uint64 // Generation in which count was recorded.
+	count      uint32 // Number of pending commands in that generation.
 }
 
 // commandMailbox stores commands and notifies command arrival through a file descriptor.
 type commandMailbox struct {
-	commandFD             internal.FileDescriptor  // File descriptor that notifies command arrival.
-	commands              []command                // Holds the commands currently being enqueued in input order.
-	commandsSpare         []command                // Array to swap in for enqueuing at the next Drain.
-	stopCommand           *command                 // Stop command to deliver after the regular commands.
-	registerCommandQuota  uint32                   // Maximum number of pending registration commands.
-	registerCommandCount  uint32                   // Current number of pending registration commands.
-	handlerCommandCounts  map[ClientHandler]uint32 // Number of pending commands per Handler.
-	accessMutex           sync.Mutex               // Protects concurrent access to the command storage, the closed state, and the immediate write state.
-	closed                bool                     // Indicates whether commandMailbox is closed.
-	immediateWriteEnabled bool                     // Indicates whether immediate writes are enqueued because Register is processing events.
-	immediateWrites       []ClientHandler          // Holds the transmission targets enqueued as immediate writes.
-	immediateWritesSpare  []ClientHandler          // map to swap in for enqueuing at the next EndImmediateWrites.
+	commandFD             internal.FileDescriptor               // File descriptor that notifies command arrival.
+	commands              []command                             // Holds the commands currently being enqueued in input order.
+	commandsSpare         []command                             // Array to swap in for enqueuing at the next Drain.
+	stopCommand           *command                              // Stop command to deliver after the regular commands.
+	registerCommandQuota  uint32                                // Maximum number of pending registration commands.
+	registerCommandCount  uint32                                // Current number of pending registration commands.
+	handlerCommandCounts  map[ClientHandler]handlerCommandCount // Registered Handlers, with the pending command count and its generation per Handler.
+	generation            uint64                                // Current generation, advanced at every Drain.
+	accessMutex           sync.Mutex                            // Protects concurrent access to the command storage, the closed state, and the immediate write state.
+	closed                bool                                  // Indicates whether commandMailbox is closed.
+	immediateWriteEnabled bool                                  // Indicates whether Write commands are collected as immediate writes while the Reactor processes events or expired timers.
+	immediateWrites       []ClientHandler                       // Holds the transmission targets enqueued as immediate writes.
+	immediateWritesSpare  []ClientHandler                       // Array to swap in for collecting at the next EndImmediateWrites.
 }
 
 // newCommandMailbox manages commands using a notification FD, two command arrays, and a quota count.
@@ -100,7 +113,7 @@ func newCommandMailbox(commandFD internal.FileDescriptor, reserveSize uint32, re
 		stopCommand:          nil,
 		registerCommandQuota: registerCommandQuota,
 		registerCommandCount: 0,
-		handlerCommandCounts: make(map[ClientHandler]uint32),
+		handlerCommandCounts: make(map[ClientHandler]handlerCommandCount),
 		closed:               false,
 		immediateWrites:      make([]ClientHandler, 0, 64),
 		immediateWritesSpare: make([]ClientHandler, 0, 64),
@@ -108,9 +121,11 @@ func newCommandMailbox(commandFD internal.FileDescriptor, reserveSize uint32, re
 }
 
 // Open allows calls to the Enqueue* functions.
-// If clear is true, it empties the pending commands and immediate write targets.
+// If clear is true, it empties the pending commands, the Handler registry, and the immediate write
+// targets.
 //
-//   - clear: if true, it empties the pending commands and immediate write targets.
+//   - clear: if true, it empties the pending commands, the Handler registry, and the immediate
+//     write targets.
 //
 // It returns an error if not initialized.
 // It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox.
@@ -135,7 +150,8 @@ func (this *commandMailbox) Open(clear bool) error {
 // It does not add a stop command and does not close the FD.
 // If clear is false, pending commands can be received at the next Drain.
 //
-//   - clear: if true, it empties the pending commands and immediate write targets.
+//   - clear: if true, it empties the pending commands, the Handler registry, and the immediate
+//     write targets.
 //
 // It returns an error if not initialized or already closed.
 // It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox, and
@@ -159,7 +175,8 @@ func (this *commandMailbox) Stop(clear bool) error {
 	return nil
 }
 
-// Clear empties the pending regular commands, the quota counts, and the immediate write targets.
+// Clear empties the pending regular commands, the registration count, the Handler registry, and the
+// immediate write targets.
 // It keeps the open/closed state, the pending stop command, and the FD notification.
 //
 // It returns an error if not initialized.
@@ -175,8 +192,9 @@ func (this *commandMailbox) Clear() error {
 	return nil
 }
 
-// clear erases the references in the enqueue array and the counts,
-// and does not touch the array that has been returned and is being processed.
+// clear erases the references in the enqueue array, the registration count, the Handler registry,
+// and the immediate write targets, and does not touch the array that has been returned and is being
+// processed.
 // It must be called within accessMutex.
 func (this *commandMailbox) clear() {
 	clear(this.commands)
@@ -188,6 +206,7 @@ func (this *commandMailbox) clear() {
 
 // EnqueueRegisterHandler enqueues a Handler registration command.
 // It uses the Register registration quota and does not use the per-connection quota.
+// It also adds the Handler to the registry with a count of 0 in the current generation.
 // It does not check the validity of the Handler.
 //
 //   - handler: Handler to register.
@@ -201,6 +220,48 @@ func (this *commandMailbox) EnqueueRegisterHandler(handler ClientHandler) error 
 	})
 }
 
+// EnqueueUnregisterHandler enqueues the unregister command that closes the connection of the Handler.
+// It removes the Handler from the registry, so later Handler commands return
+// ErrCommandMailboxNotRegistered. It is not subject to the per-connection quota.
+//
+//   - handler: Handler to unregister.
+//   - reason: close reason to pass to OnClose.
+//   - soLinger: if true, the connection is closed with RST.
+//
+// It returns an error if closed or if the notification fails.
+func (this *commandMailbox) EnqueueUnregisterHandler(handler ClientHandler, reason error, soLinger bool) error {
+	return this.enqueue(command{
+		commandType: commandUnregisterHandler,
+		handler:     handler,
+		reason:      reason,
+		soLinger:    soLinger,
+		expiresAt:   time.Time{},
+	})
+}
+
+// UnregisterHandler removes the Handler from the registry without enqueuing a command.
+// It is used when the Reactor removes or rejects the Handler directly.
+//
+//   - handler: Handler to remove from the registry.
+//
+// It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox, and
+// ErrCommandMailboxClosed if it is closed.
+func (this *commandMailbox) UnregisterHandler(handler ClientHandler) error {
+	if this.handlerCommandCounts == nil {
+		return ErrCommandMailboxUninitialized
+	}
+
+	this.accessMutex.Lock()
+	defer this.accessMutex.Unlock()
+
+	if this.closed == true {
+		return ErrCommandMailboxClosed
+	}
+
+	delete(this.handlerCommandCounts, handler)
+	return nil
+}
+
 // EnqueueSetTimeout enqueues a timer set command.
 // It uses the per-connection quota of the Handler.
 //
@@ -208,8 +269,8 @@ func (this *commandMailbox) EnqueueRegisterHandler(handler ClientHandler) error 
 //   - timerKey: timer key.
 //   - expiresAt: absolute expiration time.
 //
-// It returns an error if closed, if the Handler is nil, if the quota is exceeded, or if the
-// notification fails.
+// It returns an error if closed, if the Handler is nil or not registered, if the quota is exceeded,
+// or if the notification fails.
 func (this *commandMailbox) EnqueueSetTimeout(handler ClientHandler, timerKey uint64, expiresAt time.Time) error {
 	return this.enqueue(command{
 		commandType: commandSetTimeout,
@@ -225,8 +286,8 @@ func (this *commandMailbox) EnqueueSetTimeout(handler ClientHandler, timerKey ui
 //   - handler: target Handler.
 //   - timerKey: timer key.
 //
-// It returns an error if closed, if the Handler is nil, if the quota is exceeded, or if the
-// notification fails.
+// It returns an error if closed, if the Handler is nil or not registered, if the quota is exceeded,
+// or if the notification fails.
 func (this *commandMailbox) EnqueueUnsetTimeout(handler ClientHandler, timerKey uint64) error {
 	return this.enqueue(command{
 		commandType: commandUnsetTimeout,
@@ -244,8 +305,8 @@ func (this *commandMailbox) EnqueueUnsetTimeout(handler ClientHandler, timerKey 
 //
 //   - handler: Handler whose data is to be sent.
 //
-// It returns an error if closed, if the Handler is nil, if the quota is exceeded, or if the
-// notification fails.
+// It returns an error if closed, if the Handler is nil or not registered, if the quota is exceeded,
+// or if the notification fails.
 func (this *commandMailbox) EnqueueWrite(handler ClientHandler) error {
 	return this.enqueue(command{
 		commandType: commandWrite,
@@ -260,8 +321,8 @@ func (this *commandMailbox) EnqueueWrite(handler ClientHandler) error {
 //   - handler: target Handler.
 //   - userEventData: user event data.
 //
-// It returns an error if closed, if the Handler is nil, if the quota is exceeded, or if the
-// notification fails.
+// It returns an error if closed, if the Handler is nil or not registered, if the quota is exceeded,
+// or if the notification fails.
 func (this *commandMailbox) EnqueueUserEvent(handler ClientHandler, userEventData any) error {
 	return this.enqueue(command{
 		commandType:   commandUser,
@@ -274,24 +335,26 @@ func (this *commandMailbox) EnqueueUserEvent(handler ClientHandler, userEventDat
 // It is not subject to the per-connection quota and keeps the enqueue order with other commands.
 //
 //   - handler: Handler to close.
+//   - abortiveCloseDeadline: abortive close deadline calculated by Close, or zero if not set.
 //
 // It returns an error if closed, if the Handler is nil, or if the notification fails.
-func (this *commandMailbox) EnqueueClose(handler ClientHandler) error {
+func (this *commandMailbox) EnqueueClose(handler ClientHandler, abortiveCloseDeadline time.Time) error {
 	return this.enqueue(command{
 		commandType: commandClose,
 		handler:     handler,
+		expiresAt:   abortiveCloseDeadline,
 	})
 }
 
-// EnqueueAbort enqueues a forced (RST) close command for the Handler.
+// EnqueueAbortiveClose enqueues a forced (RST) close command for the Handler.
 // It is not subject to the per-connection quota and keeps the enqueue order with other commands.
 //
 //   - handler: Handler to close.
 //
 // It returns an error if closed, if the Handler is nil, or if the notification fails.
-func (this *commandMailbox) EnqueueAbort(handler ClientHandler) error {
+func (this *commandMailbox) EnqueueAbortiveClose(handler ClientHandler) error {
 	return this.enqueue(command{
-		commandType: commandAbort,
+		commandType: commandAbortiveClose,
 		handler:     handler,
 	})
 }
@@ -342,8 +405,8 @@ func (this *commandMailbox) EnqueueStop() error {
 }
 
 // enqueue checks the closed state within accessMutex,
-// and divides enqueuing into registration, immediate write, and per-connection commands according
-// to the command type.
+// and divides enqueuing into registration, unregistration, immediate write, per-connection, and
+// close commands according to the command type.
 //
 //   - command: command to enqueue.
 //
@@ -363,8 +426,10 @@ func (this *commandMailbox) enqueue(command command) error {
 	switch command.commandType {
 	case commandRegisterHandler:
 		return this.enqueueRegisterCommand(command)
+	case commandUnregisterHandler:
+		return this.enqueueUnregisterCommand(command)
 	case commandWrite:
-		// If Register is processing events, it is enqueued as an immediate write without a command
+		// If the Reactor is processing events, it is enqueued as an immediate write without a command
 		// and FD notification.
 		if this.immediateWriteEnabled == true {
 			return this.enqueueImmediateWrite(command.handler)
@@ -372,11 +437,14 @@ func (this *commandMailbox) enqueue(command command) error {
 		return this.enqueueHandlerCommand(command)
 	case commandSetTimeout, commandUnsetTimeout, commandUser:
 		return this.enqueueHandlerCommand(command)
-	case commandClose, commandAbort:
-		// Close commands are not counted in the per-connection quota. HandlerContext enqueues at
-		// most one per connection.
+	case commandClose, commandAbortiveClose:
+		// Close commands are not counted in the per-connection quota, and they are enqueued even for
+		// a Handler that is not registered.
 		if command.handler == nil {
 			return ErrCommandMailboxNilHandler
+		}
+		if _, contains := this.handlerCommandCounts[command.handler]; !contains {
+			return ErrCommandMailboxNotRegistered
 		}
 		return this.appendCommand(command)
 	default:
@@ -465,6 +533,7 @@ func (this *commandMailbox) EndImmediateWrites(writer func(ClientHandler)) error
 
 // enqueueRegisterCommand checks the quota of registration commands and increments the count if
 // enqueuing succeeds.
+// It also adds the Handler to the registry with a count of 0 in the current generation.
 // The count is reset in Drain and clear.
 // It is called within accessMutex.
 //
@@ -480,7 +549,24 @@ func (this *commandMailbox) enqueueRegisterCommand(command command) error {
 		return err
 	}
 
+	this.handlerCommandCounts[command.handler] = handlerCommandCount{generation: this.generation, count: 0}
 	this.registerCommandCount++
+	return nil
+}
+
+// enqueueUnregisterCommand removes the Handler from the registry and stores the unregister command.
+// It is called within accessMutex.
+//
+//   - command: unregister command to enqueue.
+//
+// It returns an error if the notification fails.
+func (this *commandMailbox) enqueueUnregisterCommand(command command) error {
+	delete(this.handlerCommandCounts, command.handler)
+
+	if err := this.appendCommand(command); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -493,6 +579,7 @@ func (this *commandMailbox) enqueueRegisterCommand(command command) error {
 //
 // It returns an error if the Handler is nil, if the quota is exceeded, or if the notification
 // fails.
+// It returns ErrCommandMailboxNotRegistered if the Handler is not registered.
 func (this *commandMailbox) enqueueHandlerCommand(command command) error {
 	if command.handler == nil {
 		return ErrCommandMailboxNilHandler
@@ -500,7 +587,18 @@ func (this *commandMailbox) enqueueHandlerCommand(command command) error {
 
 	handler := command.handler
 
-	if this.handlerCommandCounts[handler] >= handler.GetCommandQuota() {
+	entry, contains := this.handlerCommandCounts[handler]
+
+	if contains == false {
+		return ErrCommandMailboxNotRegistered
+	}
+
+	// A count recorded in a previous generation has already been drained, so it is treated as 0.
+	if entry.generation != this.generation {
+		entry = handlerCommandCount{generation: this.generation, count: 0}
+	}
+
+	if entry.count >= handler.GetCommandQuota() {
 		return ErrCommandMailboxHandlerQuotaExceeded
 	}
 
@@ -508,7 +606,8 @@ func (this *commandMailbox) enqueueHandlerCommand(command command) error {
 		return err
 	}
 
-	this.handlerCommandCounts[handler]++
+	entry.count++
+	this.handlerCommandCounts[handler] = entry
 	return nil
 }
 
@@ -538,7 +637,8 @@ func (this *commandMailbox) appendCommand(command command) error {
 
 // Drain consumes the FD notification and returns the pending regular commands in enqueue order,
 // appending the stop command at the end if there is one.
-// It swaps the enqueue array and resets the quota counts.
+// It swaps the enqueue array, resets the registration count, and advances the generation so that
+// the per-Handler counts of the previous generation are treated as 0.
 // It is called by a single consumer.
 // The returned array is reused for enqueuing at the next Drain, so it must be processed and cleared
 // before the next Drain, and it is not kept or extended.
@@ -574,7 +674,7 @@ func (this *commandMailbox) Drain(errorCallback func(error)) []command {
 	this.commands = this.commandsSpare[:0]
 	this.commandsSpare = commands[:0]
 	this.registerCommandCount = 0
-	clear(this.handlerCommandCounts)
+	this.generation++
 
 	return commands
 }

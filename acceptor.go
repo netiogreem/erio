@@ -45,7 +45,7 @@ const (
 	AcceptorStateWaitStop                                    // State after RequestStop, waiting for WaitStop.
 )
 
-// Acceptor creates TCP connections on a single listen address.
+// Acceptor accepts TCP connections on a single listen address.
 // For a created connection, it calls the factory registered as a user function and receives the
 // returned ClientHandler.
 // It accepts connections, creates a ClientHandler for each connection, and requests registration.
@@ -55,7 +55,7 @@ const (
 // It must be created with NewAcceptor, and Start, RequestStop, and WaitStop on a zero value return
 // ErrAcceptorUninitialized.
 type Acceptor struct {
-	listener            *net.TCPListener               // TCP listener created in Start and closed in WaitStop
+	listener            *net.TCPListener               // TCP listener created in Start and closed in RequestStop
 	listenAddrPortParam netip.AddrPort                 // Listen address received by NewAcceptor, bound on every Start
 	listenAddrPort      atomic.Pointer[netip.AddrPort] // Listen address, updated to the actual bound address when Start succeeds
 	factory             ClientHandlerFactory           // Function that creates a ClientHandler for each connection
@@ -182,7 +182,7 @@ func (this *Acceptor) run() {
 		}
 
 		if err != nil {
-			// AcceptTcp errors such as exceeding the FD limit are passed on, and it continues.
+			// AcceptTCP errors such as exceeding the FD limit are passed on, and it continues.
 			this.reportError(err)
 			continue
 		}
@@ -193,10 +193,10 @@ func (this *Acceptor) run() {
 
 // RequestStop transitions the Run state to WaitStop.
 // It closes the listener to request that the accept loop end.
+// Even if closing the listener fails, it transitions to WaitStop and returns the close error.
 //
 // It returns ErrAcceptorUninitialized if not initialized, ErrAcceptorStateNotRun if not in the Run
-// state,
-// and the listener close error if closing the listener fails.
+// state, and the listener close error if closing the listener fails.
 func (this *Acceptor) RequestStop() error {
 	if this.lifecycleState == nil {
 		return ErrAcceptorUninitialized
@@ -213,7 +213,7 @@ func (this *Acceptor) RequestStop() error {
 	})
 }
 
-// WaitStop waits for termination in the WaitStop state.
+// WaitStop waits for the accept loop to end in the WaitStop state and then transitions to Stop.
 //
 // It returns ErrAcceptorUninitialized if not initialized, and ErrAcceptorStateNotWaitStop if not in
 // the WaitStop state.
@@ -289,6 +289,7 @@ func netTCPConnToFileDescriptor(netTCPConn *net.TCPConn) (FileDescriptor, error)
 // If acceptedCallback is nil or returns an error, it is rejected with rejectAcceptedCallback.
 //
 //   - netTCPConn: accepted TCP connection
+//   - listenAddrPort: listen address that accepted the connection, passed to factory
 func (this *Acceptor) acceptedConnection(netTCPConn *net.TCPConn, listenAddrPort netip.AddrPort) {
 	defer func() {
 		netTCPConn.Close()

@@ -25,17 +25,17 @@ erio는 다음과 같은 경우에 적합합니다.
 ## 주요 특징
 
 * **세션 이벤트 직렬화**
-  * 연결, 수신, 송신/송신 완료, 멀티 타이머, 종료 이벤트를 동일한 Reactor 고루틴에서 직렬로 처리하며, 같은 세션의 이벤트 콜백이 동시에 실행되지 않습니다.
+  * 연결, 수신, 수신 종료(상대방 half-close), 송신/송신 완료, 멀티 타이머, 종료 이벤트를 동일한 Reactor 고루틴에서 직렬로 처리하며, 같은 세션의 이벤트 콜백이 동시에 실행되지 않습니다.
 * **여러 리스닝 주소와 연결 분산**
   * 여러 주소와 포트를 등록하고, 수락한 연결을 여러 Reactor에 순환 배정할 수 있습니다.
 * **연결별 고루틴 없는 다중 세션 처리**
   * 연결마다 송수신 고루틴을 사용하지 않고, 각 Reactor는 epoll로 이벤트를 받아, 그 이벤트가 발생한 연결의 ClientHandler를 식별해 처리합니다.
 * **보낸 데이터 완료시점**
   * 세션 이벤트가 처리되는 동일한 고루틴에서 Write로 쓰기 요청한 데이터를 OnWritten(streamID)으로 커널 전달 완료를 확인하고, 다음 데이터의 쓰기를 이어갈 수 있습니다.
-* **하나의 세션에서 멀티 타이머**
+* **세션별 멀티 타이머**
   * 세션 이벤트가 처리되는 동일한 고루틴에서 SetTimeout(timerKey, timeout), OnTimeout(timerKey) 타이머키로 응답 대기·유휴 연결·인증 제한 시간을 각각 관리할 수 있습니다.
 * **외부 고루틴에서 세션 제어**
-  * HandlerContext의 Write, SetTimeout, UnsetTimeout, Close, Abort, PostUserEvent는 외부 고루틴에서 별도의 추가 작업(동기화 작업따위) 없이 호출할 수 있습니다.
+  * HandlerContext의 Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent는 외부 고루틴에서 별도의 추가 작업(동기화 작업따위) 없이 호출할 수 있습니다.
 * **원하는 세션에 사용자 데이터셋의 비동기 전달**
   * 외부 고루틴에서 원하는 세션에 사용자가 정의한 데이터셋을 비동기로 전달하고, 해당 세션이 동작하는 고루틴의 세션에서 받을 수 있습니다.
 
@@ -48,9 +48,9 @@ erio와 gnet 모두 공개 API를 사용하며 수신된 패킷별로 하나의 
 
 ### 8-byte response
 
-클라이언트로 부터 수신 후 테스트 서버는 개별 패킷별로 8바이트 수신 완료 응답을 보냅니다.
+클라이언트로부터 수신 후 테스트 서버는 개별 패킷별로 8바이트 수신 완료 응답을 보냅니다.
 
-### erio
+#### erio
 
 | Client<br />message <br />size | Pipelined<br />requests<br /> per client |       **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |         CPU / RSS |
 | -----------------------------: | ---------------------------------------: | ------------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
@@ -63,16 +63,16 @@ erio와 gnet 모두 공개 API를 사용하며 수신된 패킷별로 하나의 
 
 > Send, receive, and response-check counts all matched, with 0 errors. CPU usage counts one logical CPU as 100%.
 
-### gnet v2.10.0
+#### gnet v2.10.0
 
 | Client<br />message <br />size | Pipelined<br /> requests<br /> per client |     **TPS** | Avg TPS<br /> per Reactor | Receive<br /> throughput | Messages<br /> processed | Elapsed<br /> time |         CPU / RSS |
 | -----------------------------: | ----------------------------------------: | ----------------: | ------------------------: | -----------------------: | -----------------------: | -----------------: | -----------------: |
 |                    1,000 bytes |                                       100 | **530,792** |         **106,158** |              530.79 MB/s |               15,926,220 |           30.005 s | 502.5% / 11.50 MiB |
 |                    1,000 bytes |                                         1 | **311,798** |          **62,360** |              311.80 MB/s |                9,354,398 |           30.001 s | 503.4% / 14.56 MiB |
 
-### 65535-byte response
+### 65536-byte response
 
-클라이언트로 부터 수신 후 테스트 서버는 개별 패킷별로 65536 바이트 수신 완료 응답을 보냅니다.
+클라이언트로부터 수신 후 테스트 서버는 개별 패킷별로 65536 바이트 수신 완료 응답을 보냅니다.
 
 #### erio
 
@@ -92,26 +92,27 @@ erio와 gnet 모두 공개 API를 사용하며 수신된 패킷별로 하나의 
 
 ## 빠른 시작
 
-> 아래 코드는 examples/echo_server/main.go와 같습니다. 새 서버를 만들 때 템플릿으로 활용하실 수 있습니다.
-
 erio는 **On{Event}(onComplete func(...)) 패턴**의 **콜백에만 의존하는 구현 방식을 지양**합니다.
 
-대신 사용자가 인터페이스의 콜백 이벤트들을 직접 구현하도록 설계하고, **오용(misuse)**하기 어려운 구조를 만드는 데 노력하였습니다.
+대신 사용자가 인터페이스의 콜백 이벤트들을 직접 구현하도록 설계하고, **오용(misuse)** 하기 어려운 구조를 만드는 데 노력하였습니다.
 
 > 콜백으로 완료 인자를 받는 **On{Event}(onComplete func(...))** 의 형태는 동시성 문제를 사용자가 추가적으로 해결해야 합니다.
 >
 > 따라서 erio는 다른 프레임워크들과 달리 **기본/공백 구현 메서드나 이벤트별로 콜백함수를 인자로 받는 메서드**는 제공하지 않습니다.
 >
-> - OnUserEvent와 OnTimeout은 사용자 선택사항으로 예외로 기본/공백 구현 메서드가 구현되어 있습니다.
+> - OnUserEvent, OnTimeout, OnReadClose는 사용자 선택사항이므로 예외로 합니다. OnUserEvent와 OnTimeout의 기본 구현은 빈 함수이며, OnReadClose의 기본 구현은 Close를 호출합니다.
 
 ### 에코서버 예제
+
+> 아래 코드는 examples/echo_server/main.go와 같습니다.
+> 새 서버를 만들 때 템플릿으로 활용하실 수 있습니다.
 
 다음은 수신한 데이터를 그대로 돌려주는 TCP 에코 서버입니다.
 
 HandlerContext를 임베딩하고 이벤트 콜백을 구현한 뒤, Builder에 Handler 생성 함수를 등록합니다.
 
 ```go
-// erio 에코 서버 예제: 받은 데이터를 돌려보내고, 10초 동안 송수신이 없으면 연결을 닫습니다.
+// erio 에코 서버 예제: 받은 데이터를 돌려보내고, 10초 동안 수신이 없으면 연결을 닫습니다.
 package main
 
 import (
@@ -144,9 +145,9 @@ const ALIVE_TIMER_KEY uint64 = 10
 // Acceptor가 연결을 수락할 때마다 호출합니다.
 // 참고: client_handler.go::ClientHandlerFactory
 func EchoHandlerFactory(fd erio.FileDescriptor, listenAddr netip.AddrPort) (erio.ClientHandler, error) {
-	// 송신 버퍼 64KiB, 명령 한도 64개.
+	// 송신 버퍼 64KiB, 명령 한도 64개, abortiveCloseTimeout 0(Close는 데이터를 다 보낼 때까지 기다림).
 	// 참고: handler_context.go::NewHandlerContext
-	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64)
+	handler, err := erio.NewHandlerContext(fd, listenAddr, 65536, 64, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +201,7 @@ func (this *EchoHandler) OnError(context *HandlerContext, clientError error) {
 }
 
 // 연결이 제거될 때 한 번 호출됩니다.
-// closeReason: ErrTCPReactorReadHangup, ErrTCPReactorHangup, ErrTCPReactorStopped 등
+// closeReason: ErrTCPReactorCloseRequested, ErrTCPReactorAbortiveClose, ErrTCPReactorAbortiveCloseTimeout, ErrTCPReactorHangup, ErrTCPReactorStopped
 func (this *EchoHandler) OnClose(context *HandlerContext, closeReason error) {
 	log.Printf("%s 종료: %v", context.PeerAddrPort(), closeReason)
 	log.Printf("접속중인 Client 수: %d", context.Count())
@@ -244,7 +245,7 @@ func main() {
 }
 ```
 
-위 코드를 erio/examples/echo_server/main.go에 저장한 뒤 erio/ 디렉터리에서 실행합니다.
+erio/ 디렉터리에서 실행합니다.
 
 ```bash
 go run ./examples/echo_server
@@ -307,8 +308,12 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
     * ReadBufferSize: Reactor별 수신 버퍼의 크기 입니다.
     * ErrorCallback: Reactor 오류 콜백 함수 입니다.
 * WithListenAddress(listenAddress string)
-  * 리스닝 주소를 등록 합니다.(ex: 172.30.10.10:30010)
+  * "IP:port" 형식의 리스닝 주소를 등록 합니다.(ex: 172.30.10.10:30010)
+  * 호스트 이름은 해석하지 않으며, Build에서 오류로 처리됩니다.
   * 다수의 리스닝을 추가하려면 재호출 합니다.
+* WithAcceptErrorCallback
+  * 연결 수락, Handler 생성, Reactor 등록 요청 과정에서 발생한 오류를 받을 콜백을 설정합니다.
+  * 콜백은 각 Acceptor의 수락 루프 고루틴에서 호출됩니다.
 * WithClientHandlerFactory
   * ClientHandler 인터페이스의 구현체를 반환하는 Factory 함수를 등록합니다.
   * Factory함수 형식: func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
@@ -369,7 +374,7 @@ func (this *TCPServer) ListenAddrPorts() []netip.AddrPort
 
 ClientHandler의 콜백 함수는 모두 동일한 고루틴에서 호출되어 세션 이벤트 직렬화를 유지합니다.
 
-erio는 **On{Event}(완료 콜백 함수) 구조와 같은 콜백에만 의존하는 구현 방식을 지양함**에 따라 사용자 선택 사항인 OnUserEvent와 OnTimeout을 제외하고는 **기본/공백 구현 함수나 이벤트별 콜백함수**를 제공하지 않습니다.
+erio는 **On{Event}(완료 콜백 함수) 구조와 같은 콜백에만 의존하는 구현 방식을 지양함**에 따라, 사용 여부가 사용자 선택 사항인 OnUserEvent, OnTimeout, OnReadClose를 제외하고는 **기본/공백 구현 함수나 이벤트별 콜백함수**를 제공하지 않습니다. OnUserEvent와 OnTimeout의 기본 구현은 빈 함수이며, OnReadClose의 기본 구현은 Close를 호출합니다.
 
 * 사용자는 연결당 생성되는 ClientHandler 인터페이스를 구현해야 합니다.
 * ClientHandler는 외부 고루틴에서 사용해서는 안됩니다.
@@ -389,7 +394,7 @@ type FileDescriptor = internal.FileDescriptor
 
 // ClientHandlerFactory는 Acceptor가 수락한 연결마다 호출하는 ClientHandler 생성 함수입니다.
 // fd는 연결된 FileDescriptor이고, listenAddress는 연결을 수락한 리스닝 주소입니다.
-// 오류를 반환하거나 nil Handler를 반환하면 Acceptor가 연결을 거절합니다.
+// 오류를 반환하거나 nil Handler 또는 typed nil Handler를 반환하면 Acceptor가 연결을 거절합니다.
 type ClientHandlerFactory func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
 
 // ClientHandler는 TCPReactor에서 클라이언트 이벤트를 처리하는 사용자용 콜백 인터페이스입니다.
@@ -424,6 +429,7 @@ type ClientHandler interface {
 	OnUserEvent(context *HandlerContext, userEventData any)
 
 	// OnTimeout은 타이머가 만료되었을 때 호출됩니다.
+	// 사용자 선택사항이므로 HandlerContext에 빈메서드로 구현되어 있습니다.
 	//
 	//   - context: 해당 연결의 HandlerContext
 	//   - timerKey: 만료된 타이머의 키
@@ -433,16 +439,28 @@ type ClientHandler interface {
 	//
 	//   - context: 해당 연결의 HandlerContext
 	//   - clientError: 발생한 오류
+	//
+	// TCPReactor 등록에 실패하면 OnError만 호출되고, OnConnect와 OnClose는 호출되지 않습니다.
+	// TCPReactor.RegisterHandler 자체가 오류를 반환하면 ClientHandler 콜백은 호출되지 않고,
+	// 오류는 WithAcceptErrorCallback으로 설정한 콜백으로 전달됩니다.
 	OnError(context *HandlerContext, clientError error)
 
-	// OnClose는 연결이 끊어지고 Reactor에서 분리되고 난 후 호출됩니다.
+	// OnReadClose는 상대방의 FIN이 도착하면, FIN 이전에 받은 데이터를 모두 OnRead로 전달한 뒤 한 번 호출됩니다.
+	// FIN만으로는 구분할 수 없으므로, 상대방이 연결 전체를 닫은 경우에도 호출됩니다.
+	// 이후에도 Write를 사용할 수 있습니다. HandlerContext가 Close를 호출하는 기본 구현을 제공합니다.
+	//
+	//   - context: 해당 연결의 HandlerContext
+	OnReadClose(context *HandlerContext)
+
+	// OnClose는 연결이 닫히고 Reactor에서 분리된 뒤 한 번 호출됩니다.
 	//
 	//   - context: 해당 연결의 HandlerContext
 	//   - closeReason: 연결 종료 사유
 	//
-	// closeReason은 연결이 끊기면 ErrTCPReactorHangup,
-	// 상대방이 송신 측을 닫거나 Close, Abort 요청이 처리되면 ErrTCPReactorReadHangup,
-	// TCPReactor가 중지되면 ErrTCPReactorStopped가 됩니다.
+	// closeReason은 Close가 완료되면 ErrTCPReactorCloseRequested,
+	// AbortiveClose가 처리되면 ErrTCPReactorAbortiveClose,
+	// Close 후 abortiveCloseTimeout 안에 남은 데이터를 보내지 못하면 ErrTCPReactorAbortiveCloseTimeout,
+	// 연결이 끊기면 ErrTCPReactorHangup, TCPReactor가 중지되면 ErrTCPReactorStopped가 됩니다.
 	OnClose(context *HandlerContext, closeReason error)
 
 	// GetCommandQuota는 명령어 한도를 반환합니다.
@@ -461,21 +479,23 @@ type ClientHandler interface {
 ### HandlerContext
 
 * ClientHandler에 임베딩하여 사용해야 합니다.
-* HandlerContext는 ClientHandler를 제어하는 Type으로써 HandlerContext의 Init() and Reset() 메서드를 제외한 다른 메서드들은 외부 고루틴에서도 사용할 수 있는 thread-safe 메서드들 입니다.
-* HandlerContext 메서드의 명령 요청(Write, SetTimeout, UnsetTimeout, Close, Abort, PostUserEvent) 호출은 이벤트 직렬화를 위해 TCPReactor로의 비동기 요청이며, 이 요청은 TCPReactor에서 처리되고 ClientHandler의 해당 함수들을 호출하여 줍니다.
+* HandlerContext는 ClientHandler를 제어하는 Type으로써 HandlerContext의 Init()과 Reset() 메서드를 제외한 다른 메서드들은 외부 고루틴에서도 사용할 수 있는 thread-safe 메서드들 입니다.
+* HandlerContext 메서드의 명령 요청(Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent) 호출은 이벤트 직렬화를 위해 TCPReactor로의 비동기 요청이며, 이 요청은 TCPReactor에서 처리되고 ClientHandler의 해당 함수들을 호출하여 줍니다.
 
 ```Go
 // 클라이언트 TCP 연결을 위한 HandlerContext를 생성합니다.
+// abortiveCloseTimeout은 Close 호출 후 남은 쓰기 데이터를 보내기까지 기다리는 시간입니다.
+// 이 시간 안에 다 보내지 못하면 RST로 닫습니다. 0이면 다 보낼 때까지 기다립니다.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddress netip.AddrPort,
-	writeBufferSize uint32, commandQuota uint32) (*HandlerContext, error)
+	writeBufferSize uint32, commandQuota uint32, abortiveCloseTimeout time.Duration) (*HandlerContext, error)
 
-// 기존 버퍼와 commandQuota를 재활용하고 지정한 연결 정보로 생성 직후 상태를 만듭니다.
+// 기존 버퍼, commandQuota, abortiveCloseTimeout을 재활용하고 지정한 연결 정보로 생성 직후 상태를 만듭니다.
 // 버퍼를 새로 할당하지 않습니다.
 // Reactor에 등록하기 전(ClientHandlerFactory에서 반환하기 전),
-// 또는 OnClose 안에서 마지막으로 호출해야 안전합니다
+// 또는 OnClose 안에서 마지막으로 호출해야 안전합니다.
 func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddress netip.AddrPort) error
 
-// commandQuota를 제외한 모든 상태를 비우고 handlerFD를 -1로 만듭니다.
+// commandQuota와 abortiveCloseTimeout을 제외한 모든 상태를 비우고 handlerFD를 -1로 만듭니다.
 // 버퍼는 용량을 유지합니다. handlerFD를 닫지 않으므로 연결이 닫힌 뒤 호출해야 합니다.
 // Reactor에 등록하기 전(ClientHandlerFactory에서 반환하기 전),
 // OnClose 안에서 마지막으로 호출해야 안전합니다.
@@ -507,15 +527,30 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error
 func (this *HandlerContext) PostUserEvent(userEventData any) error
 
 // 닫힌 상태를 먼저 기록하고 연결의 일반 종료를 요청합니다.
+// Write로 요청한 데이터를 모두 보낸 뒤 연결을 닫습니다.
+// abortiveCloseTimeout 안에 다 보내지 못하면 RST로 닫습니다.
 // 읽지 않은 수신 데이터가 남아 있으면 상대방은 FIN 대신 RST를 받습니다.
 func (this *HandlerContext) Close() error
 
 // 닫힌 상태를 먼저 기록하고 연결의 강제 종료(RST)를 요청합니다.
+// Close로 남은 데이터 송신을 기다리는 중에도 요청할 수 있습니다.
 // OnWritten으로 완료를 알린 데이터라도 상대방에게 전달되지 않았으면 버려집니다.
-func (this *HandlerContext) Abort() error
+func (this *HandlerContext) AbortiveClose() error
 
-// 세션이 닫힌 상태인지 확인합니다.
+// ClientHandler.OnReadClose의 기본 구현입니다. Close를 요청합니다.
+func (this *HandlerContext) OnReadClose(context *HandlerContext)
+
+// 세션이 닫혔거나 종료가 요청된 상태인지 확인합니다.
 func (this *HandlerContext) IsClosed() bool
+
+// 세션을 사용할 수 있는 상태인지 확인합니다.
+func (this *HandlerContext) IsOpen() bool
+
+// AbortiveClose가 요청되었는지 확인합니다.
+func (this *HandlerContext) IsAbortiveClosed() bool
+
+// Write로 요청한 데이터 중 아직 소켓에 쓰지 않은 크기를 반환합니다.
+func (this *HandlerContext) UnwrittenSize() uint64
 ```
 
 아래와 같이 사용할 수 있습니다.
@@ -555,5 +590,7 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
   * OnRead의 receivedData는 재사용되는 내부 버퍼입니다. 콜백 이후 보관하거나 다른 고루틴에 전달하려면 복사해야 합니다. 반면 Write는 데이터를 내부 버퍼에 복사하므로 반환 후 원본 버퍼를 재사용할 수 있습니다.
 * **OnWritten은 상대방의 수신 완료를 의미하지 않습니다.**
   * 해당 데이터가 로컬 커널에 모두 전달되었다는 의미입니다. 상대방의 수신이나 업무 처리 완료를 확인하려면 프로토콜 수준의 응답이 필요합니다.
-* **Close는 남은 데이터의 송신 완료를 보장하지 않습니다.**
-  * Close()는 닫힌 상태를 기록하고 Reactor에 연결 종료를 요청하며, 실제 연결 정리는 Reactor가 수행합니다. 아직 소켓에 쓰지 않고 HandlerContext 송신 버퍼에 남은 데이터는 버려집니다. 정리가 끝나면 Reactor가 ClientHandler.OnClose를 호출하여 줍니다.
+* **Close는 남은 데이터를 보낸 뒤 닫습니다.**
+  * Close()는 닫힌 상태를 기록하고 Reactor에 연결 종료를 요청합니다. Reactor는 HandlerContext 송신 버퍼에 남은 데이터를 모두 소켓에 쓴 뒤 연결을 닫습니다. 정리가 끝나면 Reactor가 ClientHandler.OnClose를 호출하여 줍니다.
+* **abortiveCloseTimeout이 0이면, 상대방이 읽지 않는 동안 Close가 끝나지 않습니다.**
+  * 상대방이 읽기를 멈추면 남은 데이터를 보낼 수 없어 연결이 남습니다. 연결을 반드시 닫아야 한다면 abortiveCloseTimeout을 설정하여 자동으로 닫게 하거나 AbortiveClose를 호출하세요.

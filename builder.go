@@ -72,7 +72,7 @@ func (this *Builder) WithReactor(param ReactorParam) *Builder {
 
 // WithListenAddress adds a listening address.
 // Repeated calls register all addresses in call order;
-// Build resolves the addresses.
+// Build validates the "IP:port" format; host names are not resolved and are rejected.
 //
 //   - listenAddress: Listening address in "IP:port" format; if the port is 0, a port is assigned automatically during Start
 //
@@ -110,7 +110,10 @@ func (this *Builder) WithClientHandlerFactory(factory ClientHandlerFactory) *Bui
 // If it fails after creating Reactors, it calls Cleanup on all created Reactors and returns the error combined with any cleanup errors.
 //
 // Returns a TCPServer in the Init state on success, or an error on failure.
-// Returns ErrAcceptorsEmpty if there are no listening addresses, or ErrAcceptorNilFactory if factory is nil.
+// It returns the ErrBuilderInvalid* errors for invalid ReactorParam values, ErrAcceptorInvalidAddress
+// for an invalid listening address, ErrAcceptorNilFactory if factory is nil, ErrAcceptorsEmpty if
+// there are no listening addresses, ErrAcceptorsDuplicateAddress for duplicate addresses, and the
+// Reactor or TCPServer creation error.
 func (this *Builder) Build() (server *TCPServer, err error) {
 	param, err := this.validateParam()
 	if err != nil {

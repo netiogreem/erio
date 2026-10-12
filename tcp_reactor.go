@@ -2,12 +2,13 @@ package erio
 
 import (
 	"errors"
-	"github.com/netiogreem/erio/internal"
 	"math"
 	"os"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/netiogreem/erio/internal"
 )
 
 // TCPReactorError represents state, command, and connection handling errors of TCPReactor.
@@ -37,14 +38,15 @@ const (
 	ErrTCPReactorNilHandlerContext           TCPReactorError = "erio: tcp reactor handler context is nil"
 	ErrTCPReactorNilHandlerCounter           TCPReactorError = "erio: tcp reactor handler counter is nil"
 	ErrTCPReactorDuplicateFD                 TCPReactorError = "erio: tcp reactor file descriptor is already registered"
+	ErrTCPReactorCloseRequested              TCPReactorError = "erio: connection closed by Close"
+	ErrTCPReactorAbortiveClose               TCPReactorError = "erio: connection closed by AbortiveClose"
+	ErrTCPReactorAbortiveCloseTimeout        TCPReactorError = "erio: connection closed by abortive close timeout"
 	ErrTCPReactorHangup                      TCPReactorError = "erio: client connection is closed"
-	ErrTCPReactorReadHangup                  TCPReactorError = "erio: client read side is closed"
 	ErrTCPReactorStopped                     TCPReactorError = "erio: tcp reactor is stopped"
 	ErrTCPReactorStateNotInit                TCPReactorError = "erio: tcp reactor is not in the Init state"
 	ErrTCPReactorStateNotStart               TCPReactorError = "erio: tcp reactor is not in the Start state"
 	ErrTCPReactorStateNotInitOrStopOrCleanup TCPReactorError = "erio: tcp reactor is not in the Init or Stop or Cleanup state"
 	ErrTCPReactorStateNotRun                 TCPReactorError = "erio: tcp reactor is not in the Run state"
-	ErrTCPReactorStateNotStop                TCPReactorError = "erio: tcp reactor is not in the Stop state"
 	ErrTCPReactorStateNotCleanup             TCPReactorError = "erio: tcp reactor is not in the Cleanup state"
 	ErrTCPReactorUninitialized               TCPReactorError = "erio: tcp reactor is uninitialized"
 	ErrTCPReactorInvalidReadBufferSize       TCPReactorError = "erio: invalid tcp reactor read buffer size"
@@ -79,7 +81,8 @@ type TCPReactor struct {
 //   - eventBatchSize: maximum number of events to receive in one epoll wait.
 //   - commandsReserveSize: initial reserved count for each of the two command arrays, and it must
 //     be 1 or more.
-//   - registerCommandQuota: maximum number of RegisterHandler requests.
+//   - registerCommandQuota: maximum number of pending RegisterHandler requests until the event loop
+//     drains the commands.
 //   - readBufferSize: size in bytes of the receive buffer of the Reactor, and it must be 1 or more.
 //   - ErrorCallback: callback that delivers Reactor errors, and notification is skipped if it is
 //     nil.
@@ -445,13 +448,23 @@ func (this *TCPReactor) HandlerCount() uint32 {
 
 // handleTimeouts processes expired timers and updates the next expiration time of each Handler.
 // If there are expired timers, Writes requested in OnTimeout are processed as immediate writes.
+// If the abortive close deadline of a Handler has expired, it enqueues the unregister command to
+// close the connection with RST and ErrTCPReactorAbortiveCloseTimeout. If enqueuing fails, it calls
+// OnError and removes the Handler immediately.
 //
 // It is the epoll wait time, -1 if there is no timer, with an upper limit of MaxInt32 milliseconds.
 func (this *TCPReactor) handleTimeouts() time.Duration {
 	if expired := this.clientTimer.PopExpired(); len(expired) > 0 {
 		this.commands.BeginImmediateWrites()
 		for _, handler := range expired {
-			nextExpiration, hasTimer := handler.context().onTimeout()
+			nextExpiration, hasTimer, aborted := handler.context().onTimeout()
+			if aborted == true {
+				if err := this.commands.EnqueueUnregisterHandler(handler, ErrTCPReactorAbortiveCloseTimeout, true); err != nil {
+					handler.OnError(handler.context(), err)
+					this.removeHandler(handler, ErrTCPReactorAbortiveCloseTimeout, true)
+				}
+				continue
+			}
 			this.updateClientTimer(handler, nextExpiration, hasTimer)
 		}
 		this.commands.EndImmediateWrites(this.writeImmediately)
@@ -471,6 +484,8 @@ func (this *TCPReactor) handleTimeouts() time.Duration {
 
 // writeImmediately performs the transmission enqueued as an immediate write, and registers write
 // monitoring if unsent data remains.
+// If no data remains and Close or AbortiveClose was requested, it enqueues the unregister command
+// as the close event.
 //
 //   - handler: target of the transmission, and it is ignored if it differs from the currently
 //     registered object.
@@ -485,6 +500,11 @@ func (this *TCPReactor) writeImmediately(handler ClientHandler) {
 	}
 
 	if handler.context().onWritable() == false {
+		if handler.context().isDrainedForClose() == true {
+			this.commands.EnqueueUnregisterHandler(handler,
+				ErrTCPReactorCloseRequested,
+				handler.context().IsAbortiveClosed())
+		}
 		return
 	}
 

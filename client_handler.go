@@ -1,8 +1,9 @@
 package erio
 
 import (
-	"github.com/netiogreem/erio/internal"
 	"net/netip"
+
+	"github.com/netiogreem/erio/internal"
 )
 
 // FileDescriptor is the file descriptor of a connection socket, and is an alias of
@@ -11,7 +12,7 @@ type FileDescriptor = internal.FileDescriptor
 
 // ClientHandlerFactory is the ClientHandler factory function that Acceptor calls for each accepted connection.
 // fd is the FileDescriptor of the connection, and listenAddress is the listen address that accepted the connection.
-// If it returns an error or a nil Handler, Acceptor rejects the connection.
+// If it returns an error, a nil Handler, or a typed nil Handler, Acceptor rejects the connection.
 type ClientHandlerFactory func(fd FileDescriptor, listenAddress netip.AddrPort) (ClientHandler, error)
 
 // ClientHandler is the user-facing callback interface for handling client events in a TCPReactor.
@@ -46,6 +47,7 @@ type ClientHandler interface {
 	OnUserEvent(context *HandlerContext, userEventData any)
 
 	// OnTimeout is called when a timer expires.
+	// It is optional for the user; HandlerContext provides an empty implementation.
 	//
 	//   - context: HandlerContext of the connection
 	//   - timerKey: key of the expired timer
@@ -57,17 +59,27 @@ type ClientHandler interface {
 	//   - clientError: error that occurred
 	//
 	// If TCPReactor registration fails, only OnError is called, and OnConnect and OnClose are not called.
+	// If TCPReactor.RegisterHandler itself returns an error, no ClientHandler callback is called, and
+	// the error is passed to the callback set with WithAcceptErrorCallback.
 	OnError(context *HandlerContext, clientError error)
 
-	// OnClose is called when the connection is lost and detached from the Reactor.
+	// OnReadClose is called once when the peer's FIN arrives, after all data received before the FIN
+	// has been passed to OnRead. It is also called when the peer closed the whole connection, because
+	// a FIN alone cannot tell the two apart.
+	// Write is still available. HandlerContext provides the default implementation that calls Close.
+	//
+	//   - context: HandlerContext of the connection
+	OnReadClose(context *HandlerContext)
+
+	// OnClose is called once when the connection is closed and detached from the Reactor.
 	//
 	//   - context: HandlerContext of the connection
 	//   - closeReason: reason the connection was closed
 	//
-	// closeReason is ErrTCPReactorHangup if the connection is lost, ErrTCPReactorReadHangup if the
-	// peer closes its sending side or TCPReactor processes a close request from
-	// HandlerContext.Close or HandlerContext.Abort, and ErrTCPReactorStopped if TCPReactor is
-	// stopped.
+	// closeReason is ErrTCPReactorCloseRequested if Close completes, ErrTCPReactorAbortiveClose if
+	// AbortiveClose is processed, ErrTCPReactorAbortiveCloseTimeout if the pending write data is not
+	// sent within abortiveCloseTimeout after Close, ErrTCPReactorHangup if the connection is lost, and
+	// ErrTCPReactorStopped if TCPReactor is stopped.
 	OnClose(context *HandlerContext, closeReason error)
 
 	// GetCommandQuota returns the command limit.
