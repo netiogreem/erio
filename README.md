@@ -1,6 +1,6 @@
 # erio
 
-Epoll Reactor-based TCP I/O framework
+Epoll Reactor-based TCP I/O framework [[Korean](README.ko.md)]
 
 ## Introduction
 
