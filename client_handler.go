@@ -65,11 +65,13 @@ type ClientHandler interface {
 
 	// OnReadClose is called in the following cases:
 	//  the client called CloseWrite
-	//  the client called Close while its receive buffer was empty
-	// All data sent by the client has been received and processed (OnRead),
-	// and the connection stays open, so Write can still be used.
-	// HandlerContext provides the default implementation that calls Close,
-	// which sends the pending data and then closes the connection.
+	//  the client called Close after receiving all data
+	//
+	// The server reads all data that the client sent before calling CloseWrite or Close
+	// and passes it to OnRead before calling OnReadClose.
+	// The connection remains open, so Write can still be used.
+	// HandlerContext's default implementation calls Close to send the pending data
+	// and then close the connection.
 	//
 	//   - context: HandlerContext of the connection
 	OnReadClose(context *HandlerContext)

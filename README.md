@@ -37,7 +37,9 @@ erio is a good fit for the following use cases:
 * **Asynchronous delivery of user data to a target session**
   * User-defined data can be sent asynchronously from another goroutine to any session and received in that session on the goroutine the session runs on.
 
-## Benchmarks
+## Performance
+
+These are simple measurements for performance comparison; **both the client and the server were run and measured on the same local machine.**
 
 Both erio and gnet use their public APIs to send one response per received packet (one 'Write()' call per received packet).
 
@@ -448,11 +450,13 @@ type ClientHandler interface {
 
 	// OnReadClose is called in the following cases:
 	//  the client called CloseWrite
-	//  the client called Close while its receive buffer was empty
-	// All data sent by the client has been received and processed (OnRead),
-	// and the connection stays open, so Write can still be used.
-	// HandlerContext provides the default implementation that calls Close,
-	// which sends the pending data and then closes the connection.
+	//  the client called Close after receiving all data
+	//
+	// The server reads all data that the client sent before calling CloseWrite or Close
+	// and passes it to OnRead before calling OnReadClose.
+	// The connection remains open, so Write can still be used.
+	// HandlerContext's default implementation calls Close to send the pending data
+	// and then close the connection.
 	//
 	//   - context: HandlerContext of the connection
 	OnReadClose(context *HandlerContext)
@@ -485,7 +489,7 @@ type ClientHandler interface {
 
 * Must be embedded in a ClientHandler.
 * HandlerContext is the type that controls a ClientHandler, and its methods, except Init() and Reset(), are thread-safe and can also be used from other goroutines.
-* Calls to HandlerContext's command methods (Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent) are asynchronous requests to the TCPReactor for serialized event processing; the TCPReactor processes them and calls the corresponding ClientHandler functions.
+* Calls to HandlerContext command methods (Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent) submit asynchronous requests to TCPReactor for serialized event handling. TCPReactor processes these requests and delivers them as ClientHandler events.
 
 ```Go
 // Creates a HandlerContext for a client TCP connection.

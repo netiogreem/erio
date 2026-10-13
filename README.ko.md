@@ -37,9 +37,11 @@ erio는 다음과 같은 경우에 적합합니다.
 * **외부 고루틴에서 세션 제어**
   * HandlerContext의 Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent는 외부 고루틴에서 별도의 추가 작업(동기화 작업따위) 없이 호출할 수 있습니다.
 * **원하는 세션에 사용자 데이터셋의 비동기 전달**
-  * 외부 고루틴에서 원하는 세션에 사용자가 정의한 데이터셋을 비동기로 전달하고, 해당 세션이 동작하는 고루틴의 세션에서 받을 수 있습니다.
+  * 외부 고루틴에서 원하는 세션에 사용자가 정의한 데이터셋을 비동기로 전달하고, 그 세션의  고루틴에서 해당 세션이 받아 처리할 수 있습니다.
 
 ## 성능
+
+성능 비교를 위한 단순 측정 자료이며, 클라이언트와 서버를 **모두 같은 로컬 장비에서 실행, 측정**하였습니다.
 
 erio와 gnet 모두 공개 API를 사용하며 수신된 패킷별로 하나의 응답을 전송합니다(수신된 패킷당 'Write()' 호출 1회, Pipeline이 100인 경우 100개의 패킷, 100번 응답).
 
@@ -96,7 +98,7 @@ erio는 **On{Event}(onComplete func(...)) 패턴**의 **콜백에만 의존하�
 
 대신 사용자가 인터페이스의 콜백 이벤트들을 직접 구현하도록 설계하고, **오용(misuse)** 하기 어려운 구조를 만드는 데 노력하였습니다.
 
-> 콜백으로 완료 인자를 받는 **On{Event}(onComplete func(...))** 의 형태는 동시성 문제를 사용자가 추가적으로 해결해야 합니다.
+> 콜백으로 완료 콜백 함수를 받는 **On{Event}(onComplete func(...))** 의 형태는 동시성 문제를 사용자가 추가적으로 해결해야 합니다.
 >
 > 따라서 erio는 다른 프레임워크들과 달리 **기본/공백 구현 메서드나 이벤트별로 콜백함수를 인자로 받는 메서드**는 제공하지 않습니다.
 >
@@ -104,8 +106,8 @@ erio는 **On{Event}(onComplete func(...)) 패턴**의 **콜백에만 의존하�
 
 ### 에코서버 예제
 
-> 아래 코드는 examples/echo_server/main.go와 같습니다.
 > 새 서버를 만들 때 템플릿으로 활용하실 수 있습니다.
+> 아래 코드는 examples/echo_server/main.go와 같습니다.
 
 다음은 수신한 데이터를 그대로 돌려주는 TCP 에코 서버입니다.
 
@@ -291,6 +293,8 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
 }
 ```
 
+---
+
 ## API
 
 ### Builder
@@ -447,8 +451,10 @@ type ClientHandler interface {
 
 	// OnReadClose는 다음의 경우 호출됩니다.
 	//  클라이언트가 CloseWrite 했을 때
-	//  클라이언트의 수신 버퍼가 비어 있는 상태에서 Close 했을 때
-	// 클라이언트가 보낸 데이터는 모두 수신 처리(OnRead)된 상태이며
+	//  클라이언트에서 수신이 완료된 후 Close 했을 때
+	//
+	// 클라이언트가 CloseWrite 또는 Close 전에 보낸 데이터를
+	// 서버가 모두 읽어 OnRead에 전달한 뒤 OnReadClose를 호출합니다
 	// 연결은 유지되며 Write를 계속 사용할 수 있습니다.
 	// HandlerContext의 기본 구현은 Close를 호출하여 남은 데이터를 보낸 뒤 연결을 닫습니다.
 	//
@@ -483,7 +489,7 @@ type ClientHandler interface {
 
 * ClientHandler에 임베딩하여 사용해야 합니다.
 * HandlerContext는 ClientHandler를 제어하는 Type으로써 HandlerContext의 Init()과 Reset() 메서드를 제외한 다른 메서드들은 외부 고루틴에서도 사용할 수 있는 thread-safe 메서드들 입니다.
-* HandlerContext 메서드의 명령 요청(Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent) 호출은 이벤트 직렬화를 위해 TCPReactor로의 비동기 요청이며, 이 요청은 TCPReactor에서 처리되고 ClientHandler의 해당 함수들을 호출하여 줍니다.
+* HandlerContext 메서드의 명령 요청(Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent) 호출은 이벤트 직렬화를 위해 TCPReactor로의 비동기 요청이며, 이 요청은 TCPReactor에서 처리되어 ClientHandler의 이벤트로 전달됩니다.
 
 ```Go
 // 클라이언트 TCP 연결을 위한 HandlerContext를 생성합니다.
