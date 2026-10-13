@@ -63,15 +63,18 @@ type ClientHandler interface {
 	// the error is passed to the callback set with WithAcceptErrorCallback.
 	OnError(context *HandlerContext, clientError error)
 
-	// OnReadClose is called once when the peer's FIN arrives, after all data received before the FIN
-	// has been passed to OnRead. It is also called when the peer closed the whole connection, because
-	// a FIN alone cannot tell the two apart.
-	// Write is still available. HandlerContext provides the default implementation that calls Close.
+	// OnReadClose is called in the following cases:
+	//  the client called CloseWrite
+	//  the client called Close while its receive buffer was empty
+	// All data sent by the client has been received and processed (OnRead),
+	// and the connection stays open, so Write can still be used.
+	// HandlerContext provides the default implementation that calls Close,
+	// which sends the pending data and then closes the connection.
 	//
 	//   - context: HandlerContext of the connection
 	OnReadClose(context *HandlerContext)
 
-	// OnClose is called once when the connection is closed and detached from the Reactor.
+	// OnClose is called after the Reactor detaches the ClientHandler and calls close(handlerFD).
 	//
 	//   - context: HandlerContext of the connection
 	//   - closeReason: reason the connection was closed

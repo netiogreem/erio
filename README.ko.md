@@ -14,7 +14,7 @@ erio는 다음과 같은 경우에 적합합니다.
 
 * 세션을 유지하면서, 해당 세션 내의 데이터를 세션 내에서 락 없이 변경하고 싶을 때
 * 세션 내에서 락이나 복잡한 코드 없이 독립적인 여러 타이머(예: 유휴 연결 감지, 인증 타임아웃)가 필요할 때
-* 외부 고루틴에서 세션 고루틴으로 안전한 비동기 이벤트 전달(예: Write, PostUserEvent 사용)이 필요할 때
+* 외부 고루틴에서 세션 고루틴으로 안전한 비동기 이벤트 전달(HandlerContext 메서드)이 필요할 때
 
 ## 요구사항
 
@@ -112,7 +112,7 @@ erio는 **On{Event}(onComplete func(...)) 패턴**의 **콜백에만 의존하�
 HandlerContext를 임베딩하고 이벤트 콜백을 구현한 뒤, Builder에 Handler 생성 함수를 등록합니다.
 
 ```go
-// erio 에코 서버 예제: 받은 데이터를 돌려보내고, 10초 동안 수신이 없으면 연결을 닫습니다.
+// erio 에코 서버 예제: 받은 데이터를 돌려보내고, 마지막 수신 후 10초 동안 수신이 없으면 Close()를 호출합니다.
 package main
 
 import (
@@ -155,7 +155,7 @@ func EchoHandlerFactory(fd erio.FileDescriptor, listenAddr netip.AddrPort) (erio
 	return &EchoHandler{HandlerContext: handler, streamID: 0}, nil
 }
 
-// 연결이 Reactor에 등록된 뒤 한 번 호출됩니다.
+// 연결이 Reactor에 등록된 뒤 호출됩니다.
 func (this *EchoHandler) OnConnect(context *HandlerContext) {
 	log.Printf("%s 연결, 접속중인 Client 수: %d", context.PeerAddrPort(), context.Count())
 	// 타이머는 1회성이며, 같은 키로 다시 설정하면 만료 시각이 교체됩니다.
@@ -200,7 +200,7 @@ func (this *EchoHandler) OnError(context *HandlerContext, clientError error) {
 	log.Printf("%s 오류: %v", context.PeerAddrPort(), clientError)
 }
 
-// 연결이 제거될 때 한 번 호출됩니다.
+// 연결이 제거될 때 호출됩니다.
 // closeReason: ErrTCPReactorCloseRequested, ErrTCPReactorAbortiveClose, ErrTCPReactorAbortiveCloseTimeout, ErrTCPReactorHangup, ErrTCPReactorStopped
 func (this *EchoHandler) OnClose(context *HandlerContext, closeReason error) {
 	log.Printf("%s 종료: %v", context.PeerAddrPort(), closeReason)
@@ -445,14 +445,17 @@ type ClientHandler interface {
 	// 오류는 WithAcceptErrorCallback으로 설정한 콜백으로 전달됩니다.
 	OnError(context *HandlerContext, clientError error)
 
-	// OnReadClose는 상대방의 FIN이 도착하면, FIN 이전에 받은 데이터를 모두 OnRead로 전달한 뒤 한 번 호출됩니다.
-	// FIN만으로는 구분할 수 없으므로, 상대방이 연결 전체를 닫은 경우에도 호출됩니다.
-	// 이후에도 Write를 사용할 수 있습니다. HandlerContext가 Close를 호출하는 기본 구현을 제공합니다.
+	// OnReadClose는 다음의 경우 호출됩니다.
+	//  클라이언트가 CloseWrite 했을 때
+	//  클라이언트의 수신 버퍼가 비어 있는 상태에서 Close 했을 때
+	// 클라이언트가 보낸 데이터는 모두 수신 처리(OnRead)된 상태이며
+	// 연결은 유지되며 Write를 계속 사용할 수 있습니다.
+	// HandlerContext의 기본 구현은 Close를 호출하여 남은 데이터를 보낸 뒤 연결을 닫습니다.
 	//
 	//   - context: 해당 연결의 HandlerContext
 	OnReadClose(context *HandlerContext)
 
-	// OnClose는 연결이 닫히고 Reactor에서 분리된 뒤 한 번 호출됩니다.
+	// OnClose는 Reactor가 ClientHandler와의 연결을 해제하고 close(handlerFD)를 호출한 뒤 호출됩니다.
 	//
 	//   - context: 해당 연결의 HandlerContext
 	//   - closeReason: 연결 종료 사유
@@ -485,20 +488,16 @@ type ClientHandler interface {
 ```Go
 // 클라이언트 TCP 연결을 위한 HandlerContext를 생성합니다.
 // abortiveCloseTimeout은 Close 호출 후 남은 쓰기 데이터를 보내기까지 기다리는 시간입니다.
-// 이 시간 안에 다 보내지 못하면 RST로 닫습니다. 0이면 다 보낼 때까지 기다립니다.
-func NewHandlerContext(handlerFD FileDescriptor, listenAddress netip.AddrPort,
+// 이 시간 안에 다 보내지 못하면 강제종료(RST) 합니다. 0이면 다 보낼 때까지 기다립니다.
+func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
 	writeBufferSize uint32, commandQuota uint32, abortiveCloseTimeout time.Duration) (*HandlerContext, error)
 
 // 기존 버퍼, commandQuota, abortiveCloseTimeout을 재활용하고 지정한 연결 정보로 생성 직후 상태를 만듭니다.
-// 버퍼를 새로 할당하지 않습니다.
-// Reactor에 등록하기 전(ClientHandlerFactory에서 반환하기 전),
-// 또는 OnClose 안에서 마지막으로 호출해야 안전합니다.
-func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddress netip.AddrPort) error
+// 필요하다면 Reactor에 등록하기 전 (ClientHandlerFactory에서 반환하기 전)에 호출해야 합니다.
+func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.AddrPort) error
 
 // commandQuota와 abortiveCloseTimeout을 제외한 모든 상태를 비우고 handlerFD를 -1로 만듭니다.
-// 버퍼는 용량을 유지합니다. handlerFD를 닫지 않으므로 연결이 닫힌 뒤 호출해야 합니다.
-// Reactor에 등록하기 전(ClientHandlerFactory에서 반환하기 전),
-// OnClose 안에서 마지막으로 호출해야 안전합니다.
+// 필요하다면 OnClose 안에서 마지막으로 호출해야 안전합니다.
 func (this *HandlerContext) Reset() error
 
 // 연결된 클라이언트 수를 반환합니다.
@@ -526,14 +525,14 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error
 // 사용자 명령을 접수하여 해당 세션의 Reactor 고루틴에서 ClientHandler.OnUserEvent로 전달합니다.
 func (this *HandlerContext) PostUserEvent(userEventData any) error
 
-// 닫힌 상태를 먼저 기록하고 연결의 일반 종료를 요청합니다.
-// Write로 요청한 데이터를 모두 보낸 뒤 연결을 닫습니다.
-// abortiveCloseTimeout 안에 다 보내지 못하면 RST로 닫습니다.
-// 읽지 않은 수신 데이터가 남아 있으면 상대방은 FIN 대신 RST를 받습니다.
+// 먼저 닫힘 상태를 기록하고 Reactor로 Close를 요청합니다.
+// Write로 송신 요청된 데이터를 모두 전송하고 Close합니다.
+// abortiveCloseTimeout(0) 으로 설정되지 않은 경우 송신 완료때까지 Close하지 않습니다.
+// abortiveCloseTimeout가 설정된 경우 abortiveCloseTimeout 내에 데이터가 전송되지 않으면 강제 종료(RST) 방식으로 연결이 닫힙니다.
 func (this *HandlerContext) Close() error
 
-// 닫힌 상태를 먼저 기록하고 연결의 강제 종료(RST)를 요청합니다.
-// Close로 남은 데이터 송신을 기다리는 중에도 요청할 수 있습니다.
+// 연결의 강제 종료(RST)를 요청합니다.
+// 이미 Close() 요청으로 남은 데이터 송신을 기다리는 중에도 요청할 수 있습니다.
 // OnWritten으로 완료를 알린 데이터라도 상대방에게 전달되지 않았으면 버려집니다.
 func (this *HandlerContext) AbortiveClose() error
 
@@ -585,12 +584,12 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
 * **ClientHandler는 외부 고루틴에서 사용하지 마세요.**
   * ClientHandler는 외부 고루틴에 의해 호출되는 것을 보호하지 않습니다. 외부 고루틴에서는 HandlerContext가 제공하는 제어 메서드를 사용하세요.
 * **HandlerContext의 Init() Reset()은 thread-safe가 아닙니다.**
-  * 필요시 Reactor에 등록하기 전(ClientHandlerFactory에서 반환하기 전) 또는 OnClose 안에서 마지막으로 호출해야 합니다.
+  * 필요시 Init()는 Reactor에 등록하기 전(ClientHandlerFactory에서 반환하기 전), Reset()은 OnClose 안에서 마지막으로 호출해야 합니다.
 * **OnRead의 수신 버퍼를 보관하려면 복사하세요.**
   * OnRead의 receivedData는 재사용되는 내부 버퍼입니다. 콜백 이후 보관하거나 다른 고루틴에 전달하려면 복사해야 합니다. 반면 Write는 데이터를 내부 버퍼에 복사하므로 반환 후 원본 버퍼를 재사용할 수 있습니다.
 * **OnWritten은 상대방의 수신 완료를 의미하지 않습니다.**
   * 해당 데이터가 로컬 커널에 모두 전달되었다는 의미입니다. 상대방의 수신이나 업무 처리 완료를 확인하려면 프로토콜 수준의 응답이 필요합니다.
-* **Close는 남은 데이터를 보낸 뒤 닫습니다.**
-  * Close()는 닫힌 상태를 기록하고 Reactor에 연결 종료를 요청합니다. Reactor는 HandlerContext 송신 버퍼에 남은 데이터를 모두 소켓에 쓴 뒤 연결을 닫습니다. 정리가 끝나면 Reactor가 ClientHandler.OnClose를 호출하여 줍니다.
-* **abortiveCloseTimeout이 0이면, 상대방이 읽지 않는 동안 Close가 끝나지 않습니다.**
-  * 상대방이 읽기를 멈추면 남은 데이터를 보낼 수 없어 연결이 남습니다. 연결을 반드시 닫아야 한다면 abortiveCloseTimeout을 설정하여 자동으로 닫게 하거나 AbortiveClose를 호출하세요.
+* **Close()는 남은 데이터를 보낸 뒤 close(handlerFD)를 호출합니다.**
+  * Close()는 닫힌 상태를 기록하고 Reactor에 연결 종료를 요청합니다. Reactor는 남은 데이터를 모두 보낸 뒤 close(handlerFD)를 호출하고, 그다음 OnClose를 호출합니다.
+* **abortiveCloseTimeout이 0이면, 클라이언트가 read를 하지 않는 동안 Close()가 끝나지 않습니다.**
+  * Close()는 남은 데이터를 다 보낸 뒤에 연결을 닫기 때문입니다. 꼭 닫아야 하면 abortiveCloseTimeout을 설정하거나 AbortiveClose()를 호출하세요.

@@ -12,7 +12,7 @@ erio is a good fit for the following use cases:
 
 * When you need to maintain sessions and want to modify a session's data from within that session without locks (e.g., sync.Mutex).
 * When you need independent per-session timers (e.g., idle connection detection, authentication timeouts) without locks or complex code.
-* When you need safe asynchronous event delivery from external goroutines to the session-processing goroutine (via PostUserEvent).
+* When you need safe asynchronous event delivery from external goroutines to the session-processing goroutine (via HandlerContext methods).
 
 ## Requirements
 
@@ -446,15 +446,18 @@ type ClientHandler interface {
 	// the error is passed to the callback set with WithAcceptErrorCallback.
 	OnError(context *HandlerContext, clientError error)
 
-	// OnReadClose is called once when the peer's FIN arrives, after all data received before the FIN
-	// has been passed to OnRead. It is also called when the peer closed the whole connection, because
-	// a FIN alone cannot tell the two apart.
-	// Write is still available. HandlerContext provides the default implementation that calls Close.
+	// OnReadClose is called in the following cases:
+	//  the client called CloseWrite
+	//  the client called Close while its receive buffer was empty
+	// All data sent by the client has been received and processed (OnRead),
+	// and the connection stays open, so Write can still be used.
+	// HandlerContext provides the default implementation that calls Close,
+	// which sends the pending data and then closes the connection.
 	//
 	//   - context: HandlerContext of the connection
 	OnReadClose(context *HandlerContext)
 
-	// OnClose is called once when the connection is closed and detached from the Reactor.
+	// OnClose is called after the Reactor detaches the ClientHandler and calls close(handlerFD).
 	//
 	//   - context: HandlerContext of the connection
 	//   - closeReason: reason the connection was closed
@@ -487,20 +490,17 @@ type ClientHandler interface {
 ```Go
 // Creates a HandlerContext for a client TCP connection.
 // abortiveCloseTimeout is the time to wait for the pending write data to be sent after Close is called.
-// If the data is not sent within this time, the connection is closed with RST. 0 waits until all data is sent.
+// If the data is not sent within this time, the connection is closed with a forced close (RST). 0 waits until all data is sent.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
 	writeBufferSize uint32, commandQuota uint32, abortiveCloseTimeout time.Duration) (*HandlerContext, error)
 
 // Reuses the existing buffers, commandQuota, and abortiveCloseTimeout, and reinitializes the object with the given connection information.
-// Does not allocate new buffers.
-// It is safe to call only before the handler is registered with the Reactor (before returning it
-// from ClientHandlerFactory) or as the last call in OnClose.
+// It is safe to call only before the handler is registered with the Reactor
+// (before returning it from ClientHandlerFactory).
 func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.AddrPort) error
 
 // Clears all state except commandQuota and abortiveCloseTimeout, and sets handlerFD to -1.
-// Buffers keep their capacity. It does not close handlerFD, so call it after the connection is closed.
-// It is safe to call only before the handler is registered with the Reactor (before returning it
-// from ClientHandlerFactory) or as the last call in OnClose.
+// Buffers keep their capacity. If needed, call it last inside OnClose.
 func (this *HandlerContext) Reset() error
 
 // Returns the number of connected clients.
@@ -528,15 +528,15 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error
 // Submits a user command and delivers it to ClientHandler.OnUserEvent on the session's Reactor goroutine.
 func (this *HandlerContext) PostUserEvent(userEventData any) error
 
-// Records the closed state first and requests a normal close of the connection.
-// The connection is closed after the data passed to Write is sent.
-// If the data is not sent within abortiveCloseTimeout, the connection is closed with RST.
-// If received data remains unread, the peer receives RST instead of FIN.
+// Records the closed state first, then sends a Close request to the Reactor.
+// Sends all data passed to Write, then closes the connection.
+// If abortiveCloseTimeout is not set (0), the connection is closed only after all data has been sent.
+// If abortiveCloseTimeout is set and the data is not sent within abortiveCloseTimeout, the connection is forcibly closed (RST).
 func (this *HandlerContext) Close() error
 
-// Records the closed state first and requests a forced close (RST) of the connection.
-// It can also be requested while Close is waiting for the pending write data to be sent.
-// Data not yet delivered to the peer is discarded, including data already reported by OnWritten.
+// Requests that the connection be forcibly closed (RST).
+// Can be requested even while a Close() request is already waiting for the remaining data to be sent.
+// Even data reported as complete via OnWritten is discarded if it has not been delivered to the peer.
 func (this *HandlerContext) AbortiveClose() error
 
 // Default implementation of ClientHandler.OnReadClose. It requests Close.
@@ -587,12 +587,12 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
 * **Do not use ClientHandler from other goroutines.**
   * ClientHandler is not safe to call from other goroutines. From other goroutines, use the control methods provided by HandlerContext.
 * **Init() and Reset() on HandlerContext are not thread-safe.**
-  * When necessary, call it last, either before registering with the Reactor (i.e., before returning from ClientHandlerFactory) or inside OnClose.
+  * If needed, Init() must be called before registering with the Reactor (before returning from ClientHandlerFactory), and Reset() must be called last inside OnClose.
 * **Copy the OnRead receive buffer if you need to keep it.**
   * receivedData in OnRead is a reused internal buffer. Copy it if you keep it after the callback or pass it to another goroutine. Write, on the other hand, copies the data into an internal buffer, so you can reuse the original buffer after it returns.
 * **OnWritten does not mean the peer has received the data.**
   * It means the data has been fully handed over to the local kernel. To confirm the peer's receipt or the completion of application-level processing, you need a protocol-level response.
-* **Close sends the remaining data before closing.**
-  * Close() records the closed state and submits a close request to the Reactor. The Reactor writes all data in the HandlerContext send buffer to the socket and then closes the connection. Once the cleanup is complete, the Reactor calls ClientHandler.OnClose().
+* **Close() sends the remaining data and then calls close(handlerFD).**
+  * Close() records the closed state and submits a close request to the Reactor. The Reactor sends all remaining data, calls close(handlerFD), and then calls OnClose.
 * **With abortiveCloseTimeout 0, Close waits as long as the peer does not read.**
-  * If the peer stops reading, the remaining data cannot be sent and the connection stays open. If the connection must be closed, set abortiveCloseTimeout to close it automatically, or call AbortiveClose.
+  * Close() closes the connection only after all remaining data is sent. If the connection must be closed, set abortiveCloseTimeout or call AbortiveClose().

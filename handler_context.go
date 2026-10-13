@@ -486,7 +486,7 @@ func (this *HandlerContext) Close() error {
 // Data not yet delivered to the peer is discarded, including data already reported by OnWritten.
 // It is not subject to the command quota.
 //
-// It returns ErrHandlerContextUninitialized if not registered, ErrHandlerContextClosed if
+// It returns ErrHandlerContextUninitialized if not registered, ErrHandlerContextAlreadyClosed if
 // AbortiveClose was already requested, or an error if the request cannot be submitted.
 func (this *HandlerContext) AbortiveClose() error {
 	if this.handler == nil || this.commands == nil {
