@@ -25,13 +25,13 @@ erio는 다음과 같은 경우에 적합합니다.
 ## 요구사항
 
 - **Linux**: epoll과 eventfd를 사용합니다.
-- **Go 1.26.0 이상**: 현재 go.mod에 지정된 버전입니다.
+- **Go 1.25.0 이상**: 현재 go.mod에 지정된 버전입니다.
 - **외부 의존성**: 타이머 관리에 github.com/emirpasic/gods v1.18.1을 사용하며, Go 모듈로 관리합니다.
 
 ## 주요 특징
 
 * **세션 이벤트 직렬화**
-  * 연결, 수신, 수신 종료(상대방 half-close), 송신/송신 완료, 멀티 타이머, 종료 이벤트를 동일한 Reactor 고루틴에서 직렬로 처리하며, 같은 세션의 이벤트 콜백이 동시에 실행되지 않습니다.
+  * 연결, 수신, 수신 종료(상대방 half-close), 송신/송신 완료, 멀티 타이머, 사용자 이벤트, Wake, 종료 이벤트를 동일한 Reactor 고루틴에서 직렬로 처리하며, 같은 세션의 이벤트 콜백이 동시에 실행되지 않습니다.
 * **여러 리스닝 주소와 연결 분산**
   * 여러 주소와 포트를 등록하고, 수락한 연결을 여러 Reactor에 순환 배정할 수 있습니다.
 * **연결별 고루틴 없는 다중 세션 처리**
@@ -41,7 +41,7 @@ erio는 다음과 같은 경우에 적합합니다.
 * **세션별 멀티 타이머**
   * 세션 이벤트가 처리되는 동일한 고루틴에서 SetTimeout(timerKey, timeout), OnTimeout(timerKey) 타이머키로 응답 대기·유휴 연결·인증 제한 시간을 각각 관리할 수 있습니다.
 * **외부 고루틴에서 세션 제어**
-  * HandlerContext의 Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent는 외부 고루틴에서 별도의 추가 작업(동기화 작업따위) 없이 호출할 수 있습니다.
+  * HandlerContext의 Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent, Wake는 외부 고루틴에서 별도의 추가 작업(동기화 작업따위) 없이 호출할 수 있습니다.
 * **원하는 세션에 사용자 데이터셋의 비동기 전달**
   * 외부 고루틴에서 원하는 세션에 사용자가 정의한 데이터셋을 비동기로 전달하고, 그 세션의  고루틴에서 해당 세션이 받아 처리할 수 있습니다.
 
@@ -108,7 +108,7 @@ erio는 **On{Event}(onComplete func(...)) 패턴**의 **콜백에만 의존하�
 >
 > 따라서 erio는 다른 프레임워크들과 달리 **기본/공백 구현 메서드나 이벤트별로 콜백함수를 인자로 받는 메서드**는 제공하지 않습니다.
 >
-> - OnUserEvent, OnTimeout, OnReadClose는 사용자 선택사항이므로 예외로 합니다. OnUserEvent와 OnTimeout의 기본 구현은 빈 함수이며, OnReadClose의 기본 구현은 Close를 호출합니다.
+> - OnUserEvent, OnWake, OnTimeout, OnReadClose는 사용자 선택사항이므로 예외로 합니다. OnUserEvent, OnWake, OnTimeout의 기본 구현은 빈 함수이며, OnReadClose의 기본 구현은 Close를 호출합니다.
 
 ### 에코서버 예제
 
@@ -299,6 +299,25 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
 }
 ```
 
+### Wake 예제
+
+HandlerContext.Wake를 호출하면 이벤트 데이터를 보내지 않고 해당 세션의 Reactor 고루틴에서 ClientHandler.OnWake 실행을 요청할 수 있습니다. 
+
+Wake의 요청은 OnWake 실행 전까지 여러 번 요청되더라도 한 번의 요청으로 기록되며  OnWake가  호출된 이후 Wake의 요청은 다음 실행 요청으로 대기하게 됩니다.
+
+```go
+// 외부 고루틴에서 요청합니다.
+// context는 대상 세션의 *erio.HandlerContext입니다.
+if err := context.Wake(); err != nil {
+	log.Printf("Wake 요청 실패: %v", err)
+}
+
+// 해당 세션의 Reactor 고루틴에서 실행됩니다.
+func (this *MyHandler) OnWake(context *erio.HandlerContext) {
+	log.Printf("세션=%s Wake", context.PeerAddrPort())
+}
+```
+
 ---
 
 ## API
@@ -384,7 +403,7 @@ func (this *TCPServer) ListenAddrPorts() []netip.AddrPort
 
 ClientHandler의 콜백 함수는 모두 동일한 고루틴에서 호출되어 세션 이벤트 직렬화를 유지합니다.
 
-erio는 **On{Event}(완료 콜백 함수) 구조와 같은 콜백에만 의존하는 구현 방식을 지양함**에 따라, 사용 여부가 사용자 선택 사항인 OnUserEvent, OnTimeout, OnReadClose를 제외하고는 **기본/공백 구현 함수나 이벤트별 콜백함수**를 제공하지 않습니다. OnUserEvent와 OnTimeout의 기본 구현은 빈 함수이며, OnReadClose의 기본 구현은 Close를 호출합니다.
+erio는 **On{Event}(완료 콜백 함수) 구조와 같은 콜백에만 의존하는 구현 방식을 지양함**에 따라, 사용 여부가 사용자 선택 사항인 OnUserEvent, OnWake, OnTimeout, OnReadClose를 제외하고는 **기본/공백 구현 함수나 이벤트별 콜백함수**를 제공하지 않습니다. OnUserEvent, OnWake, OnTimeout의 기본 구현은 빈 함수이며, OnReadClose의 기본 구현은 Close를 호출합니다.
 
 * 사용자는 연결당 생성되는 ClientHandler 인터페이스를 구현해야 합니다.
 * ClientHandler는 외부 고루틴에서 사용해서는 안됩니다.
@@ -424,21 +443,27 @@ type ClientHandler interface {
 	//   - receivedData: 수신한 데이터
 	OnRead(context *HandlerContext, receivedData []byte)
 
-	// OnWritten은 Write로 요청한 데이터가 커널에 쓰기 완료되었을 때 호출됩니다.
+	// OnWritten은 HandlerContext.Write로 요청한 데이터가 커널에 쓰기 완료되었을 때 호출됩니다.
 	//
 	//   - context: 해당 연결의 HandlerContext
 	//   - streamID: Write 시 사용자가 정의한 streamID
 	//   - writtenBytes: 쓰기 완료된 바이트 수
 	OnWritten(context *HandlerContext, streamID int32, writtenBytes uint32)
 
-	// OnUserEvent는 PostUserEvent로 접수한 사용자 이벤트 데이터를 처리합니다.
+	// OnUserEvent는 HandlerContext.PostUserEvent로 접수한 사용자 이벤트 데이터를 처리합니다.
 	// 사용자 선택사항이므로 HandlerContext에 빈메서드로 구현되어 있습니다.
 	//
 	//   - context: 해당 연결의 HandlerContext
 	//   - userEventData: 사용자가 접수한 이벤트 데이터
 	OnUserEvent(context *HandlerContext, userEventData any)
 
-	// OnTimeout은 타이머가 만료되었을 때 호출됩니다.
+	// OnWake는 HandlerContext.Wake 요청에 따라 Reactor 고루틴에서 호출됩니다.
+	// 사용자 선택사항이므로 HandlerContext에 빈메서드로 구현되어 있습니다.
+	//
+	//   - context: 해당 연결의 HandlerContext
+	OnWake(context *HandlerContext)
+
+	// OnTimeout은 HandlerContext.SetTimeout으로 설정된 타이머가 만료되었을 때 호출됩니다.
 	// 사용자 선택사항이므로 HandlerContext에 빈메서드로 구현되어 있습니다.
 	//
 	//   - context: 해당 연결의 HandlerContext
@@ -495,7 +520,7 @@ type ClientHandler interface {
 
 * ClientHandler에 임베딩하여 사용해야 합니다.
 * HandlerContext는 ClientHandler를 제어하는 Type으로써 HandlerContext의 Init()과 Reset() 메서드를 제외한 다른 메서드들은 외부 고루틴에서도 사용할 수 있는 thread-safe 메서드들 입니다.
-* HandlerContext 메서드의 명령 요청(Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent) 호출은 이벤트 직렬화를 위해 TCPReactor로의 비동기 요청이며, 이 요청은 TCPReactor에서 처리되어 ClientHandler의 이벤트로 전달됩니다.
+* HandlerContext 메서드의 명령 요청(Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent, Wake) 호출은 이벤트 직렬화를 위해 TCPReactor로의 비동기 요청이며, 이 요청은 TCPReactor에서 처리되어 ClientHandler의 이벤트로 전달됩니다.
 
 ```Go
 // 클라이언트 TCP 연결을 위한 HandlerContext를 생성합니다.
@@ -536,6 +561,11 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error
 
 // 사용자 명령을 접수하여 해당 세션의 Reactor 고루틴에서 ClientHandler.OnUserEvent로 전달합니다.
 func (this *HandlerContext) PostUserEvent(userEventData any) error
+
+// 명령 할당량을 사용하지 않고 해당 세션의 Reactor 고루틴에서 OnWake 실행을 요청합니다.
+// 반복 요청은 OnWake 호출 직전까지 하나로 합쳐지며, OnWake 실행 중에는 다음 호출을 요청할 수 있습니다.
+// nil 반환은 콜백 실행을 보장하지 않습니다. 처리 전에 Handler가 제거되면 OnWake는 호출되지 않습니다.
+func (this *HandlerContext) Wake() error
 
 // 먼저 닫힘 상태를 기록하고 Reactor로 Close를 요청합니다.
 // Write로 송신 요청된 데이터를 모두 전송하고 Close합니다.

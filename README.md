@@ -17,13 +17,13 @@ erio is a good fit for the following use cases:
 ## Requirements
 
 - **Linux**: Uses epoll and eventfd.
-- **Go 1.26.0 or later**: The version currently specified in go.mod.
+- **Go 1.25.0 or later**: The version currently specified in go.mod.
 - **External dependency**: Uses github.com/emirpasic/gods v1.18.1 for timer management, managed as a Go module.
 
 ## Key Features
 
 * **Serialized processing of session events**
-  * Connection, receive, read close (peer half-close), write/write-completion, multi-timer, and close events are processed serially on the same Reactor goroutine, so event callbacks of the same session never run concurrently.
+  * Connection, receive, read close (peer half-close), write/write-completion, multi-timer, user events, wake, and close events are processed serially on the same Reactor goroutine, so event callbacks of the same session never run concurrently.
 * **Multiple listen addresses and connection distribution**
   * You can register multiple addresses and ports, and assign accepted connections to multiple Reactors in round-robin order.
 * **Multi-session handling without per-connection goroutines**
@@ -33,7 +33,7 @@ erio is a good fit for the following use cases:
 * **Multiple timers per session**
   * On the same goroutine that handles session events, you can use timer keys with SetTimeout(timerKey, timeout) and OnTimeout(timerKey) to manage response wait times, idle-connection timeouts, and authentication time limits separately.
 * **Session control from other goroutines**
-  * HandlerContext's Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, and PostUserEvent can be called from other goroutines without any extra work (such as synchronization).
+  * HandlerContext's Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent, and Wake can be called from other goroutines without any extra work (such as synchronization).
 * **Asynchronous delivery of user data to a target session**
   * User-defined data can be sent asynchronously from another goroutine to any session and received in that session on the goroutine the session runs on.
 
@@ -100,7 +100,7 @@ Instead, it is designed so that users implement the interface's event callbacks 
 >
 > Therefore, unlike other frameworks, erio does not provide **default/empty method implementations or methods that take a callback function per event as an argument**.
 >
-> - OnUserEvent, OnTimeout, and OnReadClose are exceptions, because whether to use them is the user's choice. OnUserEvent and OnTimeout do nothing by default, and OnReadClose calls Close by default.
+> - OnUserEvent, OnWake, OnTimeout, and OnReadClose are exceptions, because whether to use them is the user's choice. OnUserEvent, OnWake, and OnTimeout do nothing by default, and OnReadClose calls Close by default.
 
 ### Echo Server Example
 
@@ -291,6 +291,25 @@ func (this *MyHandler) OnUserEvent(handler *erio.HandlerContext, userEventData a
 }
 ```
 
+### Wake Example
+
+Call HandlerContext.Wake to request execution of ClientHandler.OnWake on the session's Reactor goroutine without sending event data.
+
+Multiple Wake calls before OnWake runs are recorded as a single request. Once OnWake starts, further Wake calls remain pending for the next execution.
+
+```go
+// Request from another goroutine.
+// context is the *erio.HandlerContext of the target session.
+if err := context.Wake(); err != nil {
+	log.Printf("wake request failed: %v", err)
+}
+
+// Runs on the session's Reactor goroutine.
+func (this *MyHandler) OnWake(context *erio.HandlerContext) {
+	log.Printf("session=%s wake", context.PeerAddrPort())
+}
+```
+
 ---
 
 ## API
@@ -374,9 +393,9 @@ func (this *TCPServer) ListenAddrPorts() []netip.AddrPort
 
 ### ClientHandler
 
-All ClientHandler callbacks are called on the same goroutine, which keeps session events serialized.
+All ClientHandler callbacks run on the same goroutine, keeping session events serialized.
 
-Because erio **avoids implementation approaches that rely solely on callbacks, such as the On{Event}(completion callback function) pattern**, it does not provide **default/empty implementations or per-event callback functions**, except for OnUserEvent, OnTimeout, and OnReadClose, because whether to use them is the user's choice. OnUserEvent and OnTimeout do nothing by default, and OnReadClose calls Close by default.
+erio avoids approaches that rely solely on callbacks, such as the On{Event}(onComplete func(...)) pattern. It therefore provides neither default/empty implementations nor per-event callback functions, except for the optional OnUserEvent, OnWake, OnTimeout, and OnReadClose methods. By default, OnUserEvent, OnWake, and OnTimeout do nothing, while OnReadClose calls Close.
 
 * Users must implement the ClientHandler interface. A ClientHandler is created for each connection.
 * ClientHandler must not be used from other goroutines.
@@ -417,21 +436,27 @@ type ClientHandler interface {
 	//   - receivedData: received data
 	OnRead(context *HandlerContext, receivedData []byte)
 
-	// OnWritten is called when the data requested with Write has been written to the kernel.
+	// OnWritten is called when the data requested with HandlerContext.Write has been written to the kernel.
 	//
 	//   - context: HandlerContext of the connection
 	//   - streamID: streamID defined by the user in the Write call
 	//   - writtenBytes: number of bytes written
 	OnWritten(context *HandlerContext, streamID int32, writtenBytes uint32)
 
-	// OnUserEvent processes user event data submitted via PostUserEvent.
+	// OnUserEvent processes user event data submitted via HandlerContext.PostUserEvent.
 	// It is optional for the user; HandlerContext provides an empty implementation.
 	//
 	//   - context: HandlerContext of the connection
 	//   - userEventData: event data submitted by the user
 	OnUserEvent(context *HandlerContext, userEventData any)
 
-	// OnTimeout is called when a timer expires.
+	// OnWake is called on the Reactor goroutine for a request submitted via HandlerContext.Wake.
+	// It is optional for the user; HandlerContext provides an empty implementation.
+	//
+	//   - context: HandlerContext of the connection
+	OnWake(context *HandlerContext)
+
+	// OnTimeout is called when a timer set via HandlerContext.SetTimeout expires.
 	// It is optional for the user; HandlerContext provides an empty implementation.
 	//
 	//   - context: HandlerContext of the connection
@@ -489,7 +514,7 @@ type ClientHandler interface {
 
 * Must be embedded in a ClientHandler.
 * HandlerContext is the type that controls a ClientHandler, and its methods, except Init() and Reset(), are thread-safe and can also be used from other goroutines.
-* Calls to HandlerContext command methods (Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent) submit asynchronous requests to TCPReactor for serialized event handling. TCPReactor processes these requests and delivers them as ClientHandler events.
+* Calls to HandlerContext command methods (Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent, Wake) submit asynchronous requests to TCPReactor for serialized event handling. TCPReactor processes these requests and delivers them as ClientHandler events.
 
 ```Go
 // Creates a HandlerContext for a client TCP connection.
@@ -531,6 +556,11 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error
 
 // Submits a user command and delivers it to ClientHandler.OnUserEvent on the session's Reactor goroutine.
 func (this *HandlerContext) PostUserEvent(userEventData any) error
+
+// Requests OnWake on the session's Reactor goroutine without using the command quota.
+// Repeated requests are combined until immediately before OnWake; calls during OnWake can request another callback.
+// A nil return does not guarantee callback execution. If the Handler is removed before processing, OnWake is skipped.
+func (this *HandlerContext) Wake() error
 
 // Records the closed state first, then sends a Close request to the Reactor.
 // Sends all data passed to Write, then closes the connection.

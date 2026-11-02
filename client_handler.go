@@ -46,6 +46,16 @@ type ClientHandler interface {
 	//   - userEventData: event data submitted by the user
 	OnUserEvent(context *HandlerContext, userEventData any)
 
+	// OnWake is called in the Reactor goroutine for a request submitted via HandlerContext.Wake.
+	// Wake uses a latch to combine repeated requests. The latch is cleared immediately before
+	// OnWake, so a successful Wake during the callback can enqueue another call.
+	// A queued request is delivered even after Close or AbortiveClose is requested, provided the
+	// Handler has not been removed from the Reactor before the request is processed.
+	// It is optional for the user; HandlerContext provides an empty implementation.
+	//
+	//   - context: HandlerContext of the connection
+	OnWake(context *HandlerContext)
+
 	// OnTimeout is called when a timer expires.
 	// It is optional for the user; HandlerContext provides an empty implementation.
 	//

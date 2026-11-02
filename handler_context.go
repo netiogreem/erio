@@ -50,11 +50,11 @@ const (
 	closeStateAbort                       // AbortiveClose requested by the user
 )
 
-// HandlerContext provides send/receive, close, timer, and user event features for a client TCP connection.
+// HandlerContext provides send/receive, close, timer, user event, and wake features for a client TCP connection.
 // It must be created with NewHandlerContext.
-// Write, Close, AbortiveClose, SetTimeout, UnsetTimeout, and PostUserEvent can be called concurrently from
-// multiple goroutines. Before it is registered with TCPReactor, Write, SetTimeout, UnsetTimeout, and
-// PostUserEvent return ErrHandlerContextClosed, and Close and AbortiveClose return
+// Write, Close, AbortiveClose, SetTimeout, UnsetTimeout, PostUserEvent, and Wake can be called concurrently from
+// multiple goroutines. Before it is registered with TCPReactor, Write, SetTimeout, UnsetTimeout,
+// PostUserEvent, and Wake return ErrHandlerContextClosed, and Close and AbortiveClose return
 // ErrHandlerContextUninitialized.
 type HandlerContext struct {
 	close                 atomic.Uint32            // Close state of the connection (closeStateFalse, closeStateClose, closeStateAbort)
@@ -65,6 +65,7 @@ type HandlerContext struct {
 	handler               ClientHandler            // Connection event handler
 	commands              *commandMailbox          // TCPReactor command management
 	commandQuota          uint32                   // Per-connection limit on the total of pending timer, write, and user event commands
+	wake                  atomic.Bool              // Combines Wake requests until onWake clears it before OnWake. Also cleared on enqueue failure, Init, and Reset.
 	timer                 *internal.TimerRegistry  // Timers registered for the connection
 	peerAddrPort          netip.AddrPort           // Client address and port
 	listenAddrPort        netip.AddrPort           // Address and port of the listener that accepted the connection
@@ -75,7 +76,7 @@ type HandlerContext struct {
 // NewHandlerContext creates a HandlerContext for a client TCP connection.
 //
 //   - It does not close handlerFD on creation failure, and the caller must clean up the connection.
-//   - write, close, timer, and user event requests can be used after TCPReactor registration is
+//   - write, close, timer, user event, and wake requests can be used after TCPReactor registration is
 //     complete.
 //   - The write buffer is a double buffer for minimizing locking and uses twice the specified size.
 //
@@ -93,6 +94,7 @@ type HandlerContext struct {
 //     If the limit is exceeded, the request returns an error.
 //     Write calls made while the Reactor is processing epoll events or expired timers are not
 //     included, regardless of the calling goroutine.
+//     Wake, Close, and AbortiveClose requests are not included.
 //     0 is not allowed.
 //   - abortiveCloseTimeout: time to wait for the pending write data to be sent after Close is
 //     called. If it is not sent within this time, the connection is closed with RST.
@@ -175,6 +177,7 @@ func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.
 	this.handlerFD = handlerFD
 	this.handler = nil
 	this.commands = nil
+	this.wake.Store(false)
 	this.timer = nil
 	this.peerAddrPort = peerAddrPort
 	this.listenAddrPort = listenAddrPort
@@ -207,6 +210,7 @@ func (this *HandlerContext) Reset() error {
 	this.handler = nil
 	this.commands = nil
 	// this.commandQuota = 0
+	this.wake.Store(false)
 	this.timer = nil
 	this.peerAddrPort = netip.AddrPort{}
 	this.listenAddrPort = netip.AddrPort{}
@@ -323,6 +327,13 @@ func (this *HandlerContext) ListenAddrPort() netip.AddrPort {
 //   - userEventData: event data enqueued by the user
 func (this *HandlerContext) OnUserEvent(context *HandlerContext, userEventData any) {}
 
+// OnWake provides the default implementation of the wake callback.
+// The default implementation does nothing. To handle wakes, implement this method in the user
+// handler.
+//
+//   - context: HandlerContext of the connection
+func (this *HandlerContext) OnWake(context *HandlerContext) {}
+
 // OnTimeout is called when a timer expires.
 // It provides the default implementation of the timer expiration callback. The default
 // implementation does nothing.
@@ -407,6 +418,35 @@ func (this *HandlerContext) PostUserEvent(userEventData any) error {
 	}
 
 	return this.commands.EnqueueUserEvent(this.handler, userEventData)
+}
+
+// Wake requests OnWake asynchronously in the Reactor goroutine without using the command quota.
+// Concurrent calls are combined until immediately before OnWake; calls during OnWake can request
+// another callback. A pending callback may run after a close request, but not after Handler removal.
+//
+// It returns nil on success, and returns an error if not connected or if the request cannot be submitted.
+// A nil return does not guarantee callback execution if the Handler is removed before processing.
+// It returns ErrHandlerContextClosed before registration, after Close or AbortiveClose is requested,
+// or after the connection is closed.
+func (this *HandlerContext) Wake() error {
+	if this.close.Load() != closeStateFalse {
+		return ErrHandlerContextClosed
+	}
+
+	if this.handler == nil || this.commands == nil {
+		return ErrHandlerContextUninitialized
+	}
+
+	if !this.wake.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	if err := this.commands.EnqueueWake(this.handler); err != nil {
+		this.wake.Store(false)
+		return err
+	}
+
+	return nil
 }
 
 // SetTimeout requests setting a timer.
@@ -645,6 +685,14 @@ func (this *HandlerContext) onWritable() (hasRemaining bool) {
 //   - userEventData: user event data enqueued with PostUserEvent
 func (this *HandlerContext) onUserEvent(userEventData any) {
 	this.handler.OnUserEvent(this, userEventData)
+}
+
+// onWake clears the wake latch and then calls OnWake.
+// It runs in the Reactor goroutine without checking the close state.
+// Clearing wake first allows Wake to enqueue another command during OnWake if the connection is open.
+func (this *HandlerContext) onWake() {
+	this.wake.Store(false)
+	this.handler.OnWake(this)
 }
 
 // onTimeout reports timer expiration through OnTimeout, and then checks whether the abortive close

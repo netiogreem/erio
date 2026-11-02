@@ -47,6 +47,9 @@ func (this *TCPReactor) handleCommands() (isStop bool) {
 		case commandUser:
 			this.handleCommandUser(command.handler, command.userEventData)
 
+		case commandWake:
+			this.handleCommandWake(command.handler)
+
 		case commandClose:
 			this.handleCommandClose(command.handler, command.expiresAt)
 
@@ -228,6 +231,17 @@ func (this *TCPReactor) handleCommandAbortiveClose(handler ClientHandler) {
 //   - userEventData: user event data enqueued through PostUserEvent.
 func (this *TCPReactor) handleCommandUser(handler ClientHandler, userEventData any) {
 	handler.context().onUserEvent(userEventData)
+}
+
+// handleCommandWake calls the handler's OnWake for the Wake request.
+// HandlerContext.onWake clears wake immediately before OnWake, allowing a new request during the
+// callback. A queued Wake is delivered even after Close or AbortiveClose is requested.
+// If the Handler is removed before it is processed, handleCommands discards the command and
+// OnWake is not called.
+//
+//   - handler: ClientHandler currently registered in the Reactor.
+func (this *TCPReactor) handleCommandWake(handler ClientHandler) {
+	handler.context().onWake()
 }
 
 // updateClientTimer updates the timer expiration information of the ClientHandler.

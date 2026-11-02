@@ -22,6 +22,7 @@ const (
 	commandRegisterHandler
 	commandUnregisterHandler
 	commandUser
+	commandWake          // Wake command that calls OnWake
 	commandClose         // Normal connection close command
 	commandAbortiveClose // Forced (RST) connection close command
 )
@@ -331,13 +332,28 @@ func (this *commandMailbox) EnqueueUserEvent(handler ClientHandler, userEventDat
 	})
 }
 
+// EnqueueWake enqueues a wake command.
+// It is not subject to the per-connection quota and keeps the enqueue order with other commands.
+// It requires a registered Handler. Repeated requests are combined by HandlerContext.Wake;
+// EnqueueWake itself enqueues a command on every successful call.
+//
+//   - handler: target Handler.
+//
+// It returns an error if closed, if the Handler is nil or not registered, or if the notification fails.
+func (this *commandMailbox) EnqueueWake(handler ClientHandler) error {
+	return this.enqueue(command{
+		commandType: commandWake,
+		handler:     handler,
+	})
+}
+
 // EnqueueClose enqueues a normal close command for the Handler.
 // It is not subject to the per-connection quota and keeps the enqueue order with other commands.
 //
 //   - handler: Handler to close.
 //   - abortiveCloseDeadline: abortive close deadline calculated by Close, or zero if not set.
 //
-// It returns an error if closed, if the Handler is nil, or if the notification fails.
+// It returns an error if closed, if the Handler is nil or not registered, or if the notification fails.
 func (this *commandMailbox) EnqueueClose(handler ClientHandler, abortiveCloseDeadline time.Time) error {
 	return this.enqueue(command{
 		commandType: commandClose,
@@ -351,7 +367,7 @@ func (this *commandMailbox) EnqueueClose(handler ClientHandler, abortiveCloseDea
 //
 //   - handler: Handler to close.
 //
-// It returns an error if closed, if the Handler is nil, or if the notification fails.
+// It returns an error if closed, if the Handler is nil or not registered, or if the notification fails.
 func (this *commandMailbox) EnqueueAbortiveClose(handler ClientHandler) error {
 	return this.enqueue(command{
 		commandType: commandAbortiveClose,
@@ -405,8 +421,8 @@ func (this *commandMailbox) EnqueueStop() error {
 }
 
 // enqueue checks the closed state within accessMutex,
-// and divides enqueuing into registration, unregistration, immediate write, per-connection, and
-// close commands according to the command type.
+// and divides enqueuing into registration, unregistration, immediate write, per-connection, close,
+// and wake commands according to the command type.
 //
 //   - command: command to enqueue.
 //
@@ -438,8 +454,17 @@ func (this *commandMailbox) enqueue(command command) error {
 	case commandSetTimeout, commandUnsetTimeout, commandUser:
 		return this.enqueueHandlerCommand(command)
 	case commandClose, commandAbortiveClose:
-		// Close commands are not counted in the per-connection quota, and they are enqueued even for
-		// a Handler that is not registered.
+		// Close commands do not use the per-connection quota, but require a non-nil registered Handler.
+		if command.handler == nil {
+			return ErrCommandMailboxNilHandler
+		}
+		if _, contains := this.handlerCommandCounts[command.handler]; !contains {
+			return ErrCommandMailboxNotRegistered
+		}
+		return this.appendCommand(command)
+	case commandWake:
+		// HandlerContext.Wake combines requests using HandlerContext.wake, so wake commands do not
+		// use the per-connection quota. This branch only checks the Handler and appends the command.
 		if command.handler == nil {
 			return ErrCommandMailboxNilHandler
 		}
