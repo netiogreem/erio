@@ -605,3 +605,9 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
   * Close()는 닫힌 상태를 기록하고 Reactor에 연결 종료를 요청합니다. Reactor는 남은 데이터를 모두 보낸 뒤 close(handlerFD)를 호출하고, 그다음 OnClose를 호출합니다.
 * **abortiveCloseTimeout이 0이면, 클라이언트가 read를 하지 않는 동안 Close()가 끝나지 않습니다.**
   * Close()는 남은 데이터를 다 보낸 뒤에 연결을 닫기 때문입니다. 꼭 닫아야 하면 abortiveCloseTimeout을 설정하거나 AbortiveClose()를 호출하세요.
+
+## 라이센스
+
+Copyright (c) 2026 netiogreem <netiogreem@gmail.com>, <ty7swkr@gmail.com>
+
+이 프로젝트는 Mozilla Public License 2.0에 따라 라이선스가 부여됩니다. [LICENSE](LICENSE)를 참조하세요.

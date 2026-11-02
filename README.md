@@ -600,3 +600,9 @@ func (this *MyHandler) OnClose(context *HandlerContext, closeReason error) {
   * Close() records the closed state and submits a close request to the Reactor. The Reactor sends all remaining data, calls close(handlerFD), and then calls OnClose.
 * **With abortiveCloseTimeout 0, Close waits as long as the peer does not read.**
   * Close() closes the connection only after all remaining data is sent. If the connection must be closed, set abortiveCloseTimeout or call AbortiveClose().
+
+## License
+
+Copyright (c) 2026 netiogreem <netiogreem@gmail.com>, <ty7swkr@gmail.com>
+
+This project is licensed under the Mozilla Public License 2.0. See [LICENSE](LICENSE).
