@@ -597,8 +597,8 @@ func (this *tcpReactor) HandlerCount() uint32 {
 	return this.handlerCounter.Load()
 }
 
-// handleTimeouts calls handler.context().onTimeout for every handler returned by clientTimer.PopExpired,
-// then returns the timeout for epoller.Wait from clientTimer.NextTimeout.
+// handleTimeouts calls handler.context().onTimeout for every handler that clientTimer.PopExpired reports
+// expired, then returns the timeout for epoller.Wait from clientTimer.NextTimeout.
 //
 // Returns:
 //   - -1 when clientTimer.NextTimeout reports no timer.
@@ -618,24 +618,27 @@ func (this *tcpReactor) HandlerCount() uint32 {
 //     called directly. That is acceptable here because the deadline already means writeBuffer data and
 //     queued commands are discarded.
 //   - When aborted is false, [tcpReactor.updateClientTimer] is called with the nextExpiration and hasTimer
-//     returned by onTimeout.
-//   - The expired handlers are processed between commands.BeginImmediateWrites and
-//     commands.EndImmediateWrites([tcpReactor.writeImmediately]), so [HandlerContext.Write] calls made in
-//     OnTimeout are written before returning.
+//     returned by onTimeout. That Register call goes to clientTimer while PopExpired is still iterating its
+//     own expired list, which is safe because [internal.TimerRegistry.PopExpired] removes all expired entries
+//     before the first callback.
+//   - PopExpired is called only when clientTimer.NextTimeout reports hasTimer true and remaining 0, so
+//     commands.BeginImmediateWrites and commands.EndImmediateWrites([tcpReactor.writeImmediately]) run only
+//     in iterations with at least one expired handler. [HandlerContext.Write] calls made in OnTimeout are
+//     written before returning.
 func (this *tcpReactor) handleTimeouts() time.Duration {
-	if expired := this.clientTimer.PopExpired(); len(expired) > 0 {
+	if remaining, hasTimer := this.clientTimer.NextTimeout(); hasTimer && remaining == 0 {
 		this.commands.BeginImmediateWrites()
-		for _, handler := range expired {
+		this.clientTimer.PopExpired(func(handler ClientHandler) {
 			nextExpiration, hasTimer, aborted := handler.context().onTimeout()
 			if aborted == true {
 				if err := this.commands.EnqueueUnregisterHandler(handler, ErrTCPReactorAbortiveCloseTimeout, true); err != nil {
 					handler.OnError(handler.context(), err)
 					this.removeHandler(handler, ErrTCPReactorAbortiveCloseTimeout, true)
 				}
-				continue
+				return
 			}
 			this.updateClientTimer(handler, nextExpiration, hasTimer)
-		}
+		})
 		this.commands.EndImmediateWrites(this.writeImmediately)
 	}
 

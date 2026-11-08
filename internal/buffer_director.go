@@ -36,6 +36,7 @@ const (
 	ErrBufferDirectorFull             BufferDirectorError = "erio: write buffer is full"
 	ErrBufferDirectorNilWrite         BufferDirectorError = "erio: write buffer consumer is nil"
 	ErrBufferDirectorNilOnApprove     BufferDirectorError = "erio: write buffer approval callback is nil"
+	ErrBufferDirectorNilOnConsumed    BufferDirectorError = "erio: write buffer consumed callback is nil"
 	ErrBufferDirectorInvalidWriteSize BufferDirectorError = "erio: invalid write buffer consumed size"
 )
 
@@ -158,17 +159,22 @@ func (this *BufferDirector) RemainingSize() uint64 {
 	return this.remainingSize.Load()
 }
 
-func (this *BufferDirector) ConsumeWith(consumer func(datas []byte, mesgs []MessageInfo) (consumedBytes uint32, err error),
-) (consumedBytes uint32, consumedMesgs []MessageInfo, hasRemaining bool, err error) {
+func (this *BufferDirector) ConsumeWith(
+	consumer func(datas []byte, mesgs []MessageInfo) (consumedBytes uint32, err error),
+	onConsumed func(info MessageInfo),
+) (consumedBytes uint32, hasRemaining bool, err error) {
 	if this.consumeBuffer == nil {
-		return 0, nil, false, ErrBufferDirectorUninitialized
+		return 0, false, ErrBufferDirectorUninitialized
 	}
 	if consumer == nil {
-		return 0, nil, false, ErrBufferDirectorNilWrite
+		return 0, false, ErrBufferDirectorNilWrite
+	}
+	if onConsumed == nil {
+		return 0, false, ErrBufferDirectorNilOnConsumed
 	}
 
 	if this.swapPrepared() == false {
-		return 0, nil, false, nil
+		return 0, false, nil
 	}
 
 	datas := this.consumeBuffer[this.consumeSize:len(this.consumeBuffer):len(this.consumeBuffer)]
@@ -185,11 +191,11 @@ func (this *BufferDirector) ConsumeWith(consumer func(datas []byte, mesgs []Mess
 	}
 
 	this.remainingSize.Add(-uint64(consumedBytes))
-	return consumedBytes, this.updateActiveMesgs(consumedBytes), this.swapPrepared(), consumerError
+	this.updateActiveMesgs(consumedBytes, onConsumed)
+	return consumedBytes, this.swapPrepared(), consumerError
 }
 
-func (this *BufferDirector) updateActiveMesgs(consumedSize uint32) (consumedMesgs []MessageInfo) {
-	consumedMesgs = make([]MessageInfo, 0, len(this.consumeMesgs)-int(this.consumeMesgIdx))
+func (this *BufferDirector) updateActiveMesgs(consumedSize uint32, onConsumed func(info MessageInfo)) {
 	this.consumeSize += consumedSize
 
 	remainSize := consumedSize
@@ -204,11 +210,9 @@ func (this *BufferDirector) updateActiveMesgs(consumedSize uint32) (consumedMesg
 		remainSize -= info.remain
 		info.remain = 0
 
-		consumedMesgs = append(consumedMesgs, *info)
+		onConsumed(*info)
 		this.consumeMesgIdx++
 	}
-
-	return consumedMesgs
 }
 
 func (this *BufferDirector) Consume() (datas []byte, mesgs []MessageInfo, hasRemaining bool, err error) {

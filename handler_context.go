@@ -68,20 +68,20 @@ const (
 //   - To reuse a context for another connection, call Reset last inside [ClientHandler.OnClose]
 //     and Init with the new connection before returning the handler from [ClientHandlerFactory].
 type HandlerContext struct {
-	close                 atomic.Uint32            // Current closeStateType.
-	abortiveCloseTimeout  time.Duration            // How long Close waits for pending data before aborting; 0 waits without limit.
-	abortiveCloseDeadline time.Time                // Time at which a graceful close turns abortive; zero when none.
-	handlerFD             internal.FileDescriptor  // Connected socket; -1 after Reset.
-	writeBuffer           *internal.BufferDirector // Data queued by Write and not yet sent.
-	handler               ClientHandler            // Handler that embeds this context; nil until bind.
-	commands              *commandMailbox          // Command queue of the reactor the handler is registered with; nil until bind.
-	commandQuota          uint32                   // Maximum quota-limited commands per event loop iteration.
-	wake                  atomic.Bool              // true while a Wake request is queued and not yet delivered.
-	timer                 *internal.TimerRegistry  // Timers set by SetTimeout, keyed by timerKey; nil until bind.
-	peerAddrPort          netip.AddrPort           // Remote address read from the socket at Init.
-	listenAddrPort        netip.AddrPort           // Local listen address the connection was accepted on.
-	handlerCounter        *atomic.Uint32           // Reactor's handler counter, shared after bind.
-	immediateWrite        bool                     // Set by the mailbox while a write is recorded for the current iteration.
+	close                 atomic.Uint32                   // Current closeStateType.
+	abortiveCloseTimeout  time.Duration                   // How long Close waits for pending data before aborting; 0 waits without limit.
+	abortiveCloseDeadline time.Time                       // Time at which a graceful close turns abortive; zero when none.
+	handlerFD             internal.FileDescriptor         // Connected socket; -1 after Reset.
+	writeBuffer           *internal.BufferDirector        // Data queued by Write and not yet sent.
+	handler               ClientHandler                   // Handler that embeds this context; nil until bind.
+	commands              *commandMailbox                 // Command queue of the reactor the handler is registered with; nil until bind.
+	commandQuota          uint32                          // Maximum quota-limited commands per event loop iteration.
+	wake                  atomic.Bool                     // true while a Wake request is queued and not yet delivered.
+	timer                 *internal.TimerRegistry[uint64] // Timers set by SetTimeout, keyed by timerKey; nil until bind.
+	peerAddrPort          netip.AddrPort                  // Remote address read from the socket at Init.
+	listenAddrPort        netip.AddrPort                  // Local listen address the connection was accepted on.
+	handlerCounter        *atomic.Uint32                  // Reactor's handler counter, shared after bind.
+	immediateWrite        bool                            // Set by the mailbox while a write is recorded for the current iteration.
 }
 
 // NewHandlerContext creates a [HandlerContext] for an accepted connection.
@@ -306,7 +306,7 @@ func (this *HandlerContext) bind(handler ClientHandler, commands *commandMailbox
 
 	this.handler = handler
 	this.commands = commands
-	this.timer = internal.NewTimerRegistry()
+	this.timer = internal.NewTimerRegistry[uint64]()
 	this.handlerCounter = handlerCounter
 	this.close.Store(closeStateFalse)
 	return nil
@@ -734,7 +734,8 @@ func (this *HandlerContext) onReadable(readAll bool, readBuffer []byte) (isEof b
 }
 
 // onWritable calls writeBuffer.ConsumeWith with a consumer that calls write(2) on handlerFD with
-// syscall.RawSyscall(SYS_WRITE), then calls handler.OnWritten for each message that was written completely.
+// syscall.RawSyscall(SYS_WRITE), and an onConsumed closure that calls handler.OnWritten(this, info.ID,
+// info.Length) for each message that was written completely.
 //
 // Returns:
 //   - The hasRemaining value of ConsumeWith: true when writeBuffer still has data, false when it is empty.
@@ -742,8 +743,11 @@ func (this *HandlerContext) onReadable(readAll bool, readBuffer []byte) (isEof b
 // Notes:
 //   - EINTR is retried. EAGAIN and EWOULDBLOCK are turned into a nil error, so the consumer returns the bytes
 //     written so far.
-//   - handler.OnWritten(this, info.ID, info.Length) is called for every entry of consumedMesgs before the
-//     consumeError, if any, is passed to handler.OnError as os.NewSyscallError("write", err).
+//   - OnWritten runs inside ConsumeWith, from [internal.BufferDirector.updateActiveMesgs], before the final
+//     swapPrepared. So a [HandlerContext.Write] made inside OnWritten is already in writeBuffer when
+//     hasRemaining is computed.
+//   - The consumeError, if any, is passed to handler.OnError as os.NewSyscallError("write", err) after every
+//     OnWritten call.
 func (this *HandlerContext) onWritable() (hasRemaining bool) {
 	consumer := func(data []byte, _ []internal.MessageInfo) (uint32, error) {
 		var writtenSize int
@@ -771,11 +775,10 @@ func (this *HandlerContext) onWritable() (hasRemaining bool) {
 		return uint32(writtenSize), os.NewSyscallError("write", writeError)
 	}
 
-	_, consumedMesgs, hasRemaining, consumeError := this.writeBuffer.ConsumeWith(consumer)
-
-	for _, info := range consumedMesgs {
-		this.handler.OnWritten(this, info.ID, info.Length)
-	}
+	_, hasRemaining, consumeError :=
+		this.writeBuffer.ConsumeWith(consumer, func(info internal.MessageInfo) {
+			this.handler.OnWritten(this, info.ID, info.Length)
+		})
 
 	if consumeError != nil {
 		this.handler.OnError(this, consumeError)
@@ -802,8 +805,8 @@ func (this *HandlerContext) onWake() {
 	this.handler.OnWake(this)
 }
 
-// onTimeout calls handler.OnTimeout(this, timerKey) for every key returned by timer.PopExpired() and checks
-// abortiveCloseDeadline.
+// onTimeout calls timer.PopExpired with a callback that calls handler.OnTimeout(this, timerKey) for every
+// expired timerKey, then checks abortiveCloseDeadline.
 //
 // Returns:
 //   - nextExpiration and hasTimer are the values of [HandlerContext.nextExpiration] after the expired keys
@@ -811,12 +814,12 @@ func (this *HandlerContext) onWake() {
 //   - aborted is true when abortiveCloseDeadline is not zero and is not after time.Now().
 //
 // Notes:
-//   - PopExpired removes the keys before OnTimeout runs, so [HandlerContext.SetTimeout] inside OnTimeout
-//     with the same key re-arms it.
+//   - [internal.TimerRegistry.PopExpired] removes every expired key before the first callback, so
+//     [HandlerContext.SetTimeout] inside OnTimeout with the same key re-arms it for a later call.
 func (this *HandlerContext) onTimeout() (nextExpiration time.Time, hasTimer bool, aborted bool) {
-	for _, timerKey := range this.timer.PopExpired() {
+	this.timer.PopExpired(func(timerKey uint64) {
 		this.handler.OnTimeout(this, timerKey)
-	}
+	})
 
 	if !this.abortiveCloseDeadline.IsZero() && !this.abortiveCloseDeadline.After(time.Now()) {
 		aborted = true

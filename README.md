@@ -18,7 +18,7 @@ erio is a good fit for the following use cases:
 
 - **Linux**: Uses epoll and eventfd.
 - **Go 1.25.0 or later**: The version currently specified in go.mod.
-- **External dependency**: Uses github.com/emirpasic/gods v1.18.1 for timer management, managed as a Go module.
+- **External dependency**: None. Only the standard library is used.
 
 ## Key Features
 

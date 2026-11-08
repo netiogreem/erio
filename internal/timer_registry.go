@@ -2,8 +2,6 @@ package internal
 
 import (
 	"time"
-
-	"github.com/emirpasic/gods/maps/treemap"
 )
 
 type TimerRegistryError string
@@ -14,77 +12,133 @@ func (this TimerRegistryError) Error() string {
 
 const ErrTimerRegistryUninitialized TimerRegistryError = "erio: timer registry is uninitialized"
 
-type TimerRegistry struct {
-	timerKeysByTime *treemap.Map
-	timeByTimerKey  map[uint64]time.Time
+type timerRegistryEntry[K comparable] struct {
+	expiresAt time.Time
+	key       K
 }
 
-func NewTimerRegistry() *TimerRegistry {
-	return &TimerRegistry{
-		timerKeysByTime: treemap.NewWith(func(first, second interface{}) int {
-			return first.(time.Time).Compare(second.(time.Time))
-		}),
-		timeByTimerKey: make(map[uint64]time.Time),
+type TimerRegistry[K comparable] struct {
+	entries  []timerRegistryEntry[K]
+	position map[K]int
+	expired  []K
+}
+
+func NewTimerRegistry[K comparable]() *TimerRegistry[K] {
+	return &TimerRegistry[K]{
+		position: make(map[K]int),
 	}
 }
 
-func (this *TimerRegistry) Register(expiresAt time.Time, timerKey uint64) error {
-	if this.timerKeysByTime == nil || this.timeByTimerKey == nil {
+func (this *TimerRegistry[K]) Register(expiresAt time.Time, key K) error {
+	if this.position == nil {
 		return ErrTimerRegistryUninitialized
 	}
-	this.Unregister(timerKey)
-	value, found := this.timerKeysByTime.Get(expiresAt)
-	var timerKeys map[uint64]struct{}
-	if found {
-		timerKeys = value.(map[uint64]struct{})
-	} else {
-		timerKeys = make(map[uint64]struct{})
-		this.timerKeysByTime.Put(expiresAt, timerKeys)
+
+	if index, registered := this.position[key]; registered {
+		previous := this.entries[index].expiresAt
+		this.entries[index].expiresAt = expiresAt
+		if expiresAt.Before(previous) {
+			this.siftUp(index)
+		} else {
+			this.siftDown(index)
+		}
+		return nil
 	}
-	timerKeys[timerKey] = struct{}{}
-	this.timeByTimerKey[timerKey] = expiresAt
+
+	this.entries = append(this.entries, timerRegistryEntry[K]{expiresAt: expiresAt, key: key})
+	index := len(this.entries) - 1
+	this.position[key] = index
+	this.siftUp(index)
 	return nil
 }
 
-func (this *TimerRegistry) Unregister(timerKey uint64) bool {
-	expiresAt, registered := this.timeByTimerKey[timerKey]
+func (this *TimerRegistry[K]) Unregister(key K) bool {
+	index, registered := this.position[key]
 	if !registered {
 		return false
 	}
-	value, _ := this.timerKeysByTime.Get(expiresAt)
-	timerKeys := value.(map[uint64]struct{})
-	delete(timerKeys, timerKey)
-	if len(timerKeys) == 0 {
-		this.timerKeysByTime.Remove(expiresAt)
+
+	last := len(this.entries) - 1
+	if index != last {
+		this.entries[index] = this.entries[last]
+		this.position[this.entries[index].key] = index
 	}
-	delete(this.timeByTimerKey, timerKey)
+	this.entries = this.entries[:last]
+	delete(this.position, key)
+
+	if index != last {
+		this.siftUp(index)
+		this.siftDown(index)
+	}
 	return true
 }
 
-func (this *TimerRegistry) NextExpiration() (expiresAt time.Time, hasTimer bool) {
-	if len(this.timeByTimerKey) == 0 {
+func (this *TimerRegistry[K]) NextExpiration() (expiresAt time.Time, hasTimer bool) {
+	if len(this.entries) == 0 {
 		return time.Time{}, false
 	}
-	value, _ := this.timerKeysByTime.Min()
-	return value.(time.Time), true
+	return this.entries[0].expiresAt, true
 }
 
-func (this *TimerRegistry) PopExpired() []uint64 {
-	if this.timerKeysByTime == nil {
-		return nil
-	}
-	cutoff := time.Now()
-	var expired []uint64
-	for !this.timerKeysByTime.Empty() {
-		expiresAt, value := this.timerKeysByTime.Min()
-		if expiresAt.(time.Time).After(cutoff) {
-			break
+func (this *TimerRegistry[K]) PopExpired(onExpired func(key K)) int {
+	now := time.Now()
+	for len(this.entries) > 0 && !this.entries[0].expiresAt.After(now) {
+		key := this.entries[0].key
+		last := len(this.entries) - 1
+		this.entries[0] = this.entries[last]
+		this.position[this.entries[0].key] = 0
+		this.entries = this.entries[:last]
+		delete(this.position, key)
+		if last > 0 {
+			this.siftDown(0)
 		}
-		for timerKey := range value.(map[uint64]struct{}) {
-			expired = append(expired, timerKey)
-			delete(this.timeByTimerKey, timerKey)
-		}
-		this.timerKeysByTime.Remove(expiresAt)
+		this.expired = append(this.expired, key)
 	}
-	return expired
+
+	count := len(this.expired)
+	if onExpired != nil {
+		for _, key := range this.expired {
+			onExpired(key)
+		}
+	}
+	clear(this.expired)
+	this.expired = this.expired[:0]
+	return count
+}
+
+func (this *TimerRegistry[K]) siftUp(index int) {
+	for index > 0 {
+		parent := (index - 1) / 2
+		if !this.entries[index].expiresAt.Before(this.entries[parent].expiresAt) {
+			return
+		}
+		this.swap(index, parent)
+		index = parent
+	}
+}
+
+func (this *TimerRegistry[K]) siftDown(index int) {
+	length := len(this.entries)
+	for {
+		smallest := index
+		left := 2*index + 1
+		if left < length && this.entries[left].expiresAt.Before(this.entries[smallest].expiresAt) {
+			smallest = left
+		}
+		right := left + 1
+		if right < length && this.entries[right].expiresAt.Before(this.entries[smallest].expiresAt) {
+			smallest = right
+		}
+		if smallest == index {
+			return
+		}
+		this.swap(index, smallest)
+		index = smallest
+	}
+}
+
+func (this *TimerRegistry[K]) swap(first, second int) {
+	this.entries[first], this.entries[second] = this.entries[second], this.entries[first]
+	this.position[this.entries[first].key] = first
+	this.position[this.entries[second].key] = second
 }
