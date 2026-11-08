@@ -13,73 +13,73 @@ import (
 	"github.com/netiogreem/erio/internal"
 )
 
-// AcceptorError represents an error that Acceptor returns or passes to the error callback.
+// AcceptorError is the error type returned by [Acceptor] methods.
+// It is a string so that each error can be declared as a comparable constant.
 type AcceptorError string
 
-// Error returns the error string.
+// Error returns the error message.
 //
-// It returns the Acceptor error message.
+// Returns:
+//   - The message text of the error constant.
 func (this AcceptorError) Error() string {
 	return string(this)
 }
 
-// Errors returned by Acceptor.
 const (
-	ErrAcceptorInvalidAddress      AcceptorError = "erio: invalid acceptor listen address"
-	ErrAcceptorUninitialized       AcceptorError = "erio: acceptor is uninitialized"
-	ErrAcceptorNilFactory          AcceptorError = "erio: acceptor factory is nil"
-	ErrAcceptorNilAcceptedCallback AcceptorError = "erio: acceptor accepted callback is nil"
-	ErrAcceptorInvalidHandler      AcceptorError = "erio: acceptor factory returned a typed nil handler"
-	ErrAcceptorStateNotRun         AcceptorError = "erio: acceptor is not in the Run state"
-	ErrAcceptorStateNotWaitRun     AcceptorError = "erio: acceptor is not in the WaitRun state"
-	ErrAcceptorStateNotStop        AcceptorError = "erio: acceptor is not in the Stop state"
-	ErrAcceptorStateNotWaitStop    AcceptorError = "erio: acceptor is not in the WaitStop state"
+	ErrAcceptorInvalidAddress      AcceptorError = "erio: invalid acceptor listen address"               // Returned by [NewAcceptor], wrapped with the parse error, when listenAddress is not a valid "host:port".
+	ErrAcceptorUninitialized       AcceptorError = "erio: acceptor is uninitialized"                     // Returned when the acceptor was not created with [NewAcceptor].
+	ErrAcceptorNilFactory          AcceptorError = "erio: acceptor factory is nil"                       // Returned by [NewAcceptor] when factory is nil.
+	ErrAcceptorNilAcceptedCallback AcceptorError = "erio: acceptor accepted callback is nil"             // Reported to errorCallback for every accepted connection when acceptedCallback is nil.
+	ErrAcceptorInvalidHandler      AcceptorError = "erio: acceptor factory returned a typed nil handler" // Reported to errorCallback when factory returns a nil pointer wrapped in a non-nil interface.
+	ErrAcceptorStateNotRunning     AcceptorError = "erio: acceptor is not in the Running state"          // Returned by [Acceptor.Stop] when the acceptor is not running.
+	ErrAcceptorStateNotWaitRunning AcceptorError = "erio: acceptor is not in the WaitRunning state"      // Reported to errorCallback when the accept goroutine finds the acceptor in an unexpected state.
+	ErrAcceptorStateNotStopped     AcceptorError = "erio: acceptor is not in the Stopped state"          // Returned by [Acceptor.Start] when the acceptor is already started.
+	ErrAcceptorStateNotWaitStopped AcceptorError = "erio: acceptor is not in the WaitStop state"         // Returned by [Acceptor.WaitStopped] when [Acceptor.Stop] has not been called.
 )
 
-// Lifecycle states of Acceptor.
-// It transitions in the order Stop -> WaitRun -> Run -> WaitStop -> Stop.
 const (
-	AcceptorStateStop     internal.LifecycleStateType = iota // State right after creation or after WaitStop completes, which allows only Start.
-	AcceptorStateWaitRun                                     // State in which Start creates the listener and waits for the accept loop to start.
-	AcceptorStateRun                                         // State in which the accept loop is running, which allows only RequestStop.
-	AcceptorStateWaitStop                                    // State after RequestStop, waiting for WaitStop.
+	AcceptorStateStopped     internal.StateGuardType = iota // Not listening. The initial state and the state after [Acceptor.WaitStopped].
+	AcceptorStateWaitRunning                                // Listener is open and the accept goroutine is starting.
+	AcceptorStateRunning                                    // Accepting connections.
+	AcceptorStateWaitStopped                                // Listener is closed and the accept goroutine is exiting.
 )
 
-// Acceptor accepts TCP connections on a single listen address.
-// For a created connection, it calls the factory registered as a user function and receives the
-// returned ClientHandler.
-// It accepts connections, creates a ClientHandler for each connection, and requests registration.
-// If Acceptor receives an error or nil from the factory function during the connection process, it
-// releases the connection.
-// Acceptor calls the registered user function errorCallback with its errors.
-// It must be created with NewAcceptor, and Start, RequestStop, and WaitStop on a zero value return
-// ErrAcceptorUninitialized.
+// Acceptor listens on a TCP address and hands each accepted connection to a
+// [ClientHandler] created by a [ClientHandlerFactory].
+//
+// Notes:
+//   - Lifecycle is [Acceptor.Start] -> [Acceptor.Stop] -> [Acceptor.WaitStopped], and the
+//     acceptor can be started again after WaitStopped.
+//   - Connections are accepted on a dedicated goroutine; factory and callbacks run on that goroutine.
+//   - Methods are safe to call from multiple goroutines.
 type Acceptor struct {
-	listener            *net.TCPListener               // TCP listener created in Start and closed in RequestStop
-	listenAddrPortParam netip.AddrPort                 // Listen address received by NewAcceptor, bound on every Start
-	listenAddrPort      atomic.Pointer[netip.AddrPort] // Listen address, updated to the actual bound address when Start succeeds
-	factory             ClientHandlerFactory           // Function that creates a ClientHandler for each connection
-	acceptedCallback    func(ClientHandler) error      // Function that requests registration of the created Handler
-	errorCallback       func(error)                    // Callback that delivers accept, registration request, and rejection errors, nil allowed
-	lifecycleState      *internal.LifecycleState       // Lock that protects the lifecycle state and its transitions
-	startedSignal       *internal.Signal               // Signal that notifies the start of the accept loop
-	stoppedSignal       *internal.Signal               // Signal that notifies the end of the accept loop
+	listener            *net.TCPListener               // Open listener while running, nil before the first Start.
+	listenAddrPortParam netip.AddrPort                 // Address given to NewAcceptor; port may be 0.
+	listenAddrPort      atomic.Pointer[netip.AddrPort] // Address actually bound, updated at Start so ListenAddrPort is lock-free.
+	factory             ClientHandlerFactory           // Creates a handler for each accepted connection.
+	acceptedCallback    func(ClientHandler) error      // Receives each created handler. nil rejects every connection.
+	errorCallback       func(error)                    // Receives accept and rejection errors. nil drops them.
+	state               *internal.StateGuard           // Current lifecycle state; nil for a zero-value Acceptor.
+	started             *internal.Signal               // Signaled when the accept goroutine is running.
+	stopped             *internal.Signal               // Signaled when the accept goroutine has exited.
 }
 
-// NewAcceptor validates the listen address and factory and creates an Acceptor in the Stop state.
-// It does not create the listener, and actual listening starts in Start.
-// It does not check whether acceptedCallback and errorCallback are nil.
-// If acceptedCallback is nil, accepted connections are rejected with
-// ErrAcceptorNilAcceptedCallback.
+// NewAcceptor creates an [Acceptor] for listenAddress. Listening starts at [Acceptor.Start].
 //
-//   - listenAddress: listen address in "IP:port" format, and if the port is 0, it is assigned
-//     automatically in Start
-//   - factory: function that creates a ClientHandler for each connection
-//   - acceptedCallback: function that requests registration of the created Handler
-//   - errorCallback: callback that receives accept, registration request, and rejection errors
+// Parameters:
+//   - listenAddress is an "IP:port" literal; host names are rejected. Port 0 picks a free port at [Acceptor.Start].
+//   - factory creates the handler for each accepted connection and must not be nil.
+//   - acceptedCallback receives each created handler, typically to register it with a reactor. Its error
+//     rejects the connection. nil rejects every connection with [ErrAcceptorNilAcceptedCallback].
+//   - errorCallback receives accept errors and rejection reasons. nil drops them.
 //
-// It returns ErrAcceptorInvalidAddress if the address format is invalid, and ErrAcceptorNilFactory
-// if factory is nil.
+// Returns:
+//   - The stopped acceptor and nil.
+//   - [ErrAcceptorInvalidAddress] wrapped with the parse error when listenAddress is not an "IP:port" literal.
+//   - [ErrAcceptorNilFactory] when factory is nil.
+//
+// Caution:
+//   - When factory returns an error or a nil handler, the acceptor closes fd. factory must not close it.
 func NewAcceptor(listenAddress string, factory ClientHandlerFactory, acceptedCallback func(ClientHandler) error, errorCallback func(error)) (*Acceptor, error) {
 	listenAddrPort, err := netip.ParseAddrPort(listenAddress)
 	if err != nil {
@@ -97,37 +97,38 @@ func NewAcceptor(listenAddress string, factory ClientHandlerFactory, acceptedCal
 		factory:             factory,
 		acceptedCallback:    acceptedCallback,
 		errorCallback:       errorCallback,
-		lifecycleState:      internal.NewLifecycleState(AcceptorStateStop),
-		startedSignal:       internal.NewSignal(),
-		stoppedSignal:       internal.NewSignal(),
+		state:               internal.NewStateGuard(AcceptorStateStopped),
+		started:             internal.NewSignal(),
+		stopped:             internal.NewSignal(),
 	}
 
 	acceptor.listenAddrPort.Store(&listenAddrPort)
 	return acceptor, nil
 }
 
-// Start creates the listener, starts the accept loop, and then waits for the loop to start.
-// It starts only in the Stop state and creates new start and stop signals.
-// Every Start binds to the address received by NewAcceptor, so with port 0, a new port is assigned
-// on every restart.
-// Even for an Acceptor created with port 0, the actual port can be checked with ListenAddrPort
-// after return.
-// If creating the listener fails, it stays in the Stop state.
+// Start begins accepting connections on the listen address.
 //
-// It returns ErrAcceptorUninitialized if not initialized, ErrAcceptorStateNotStop if not in the
-// Stop state, and the error itself if creating the listener fails.
+// Returns:
+//   - nil when the acceptor is running.
+//   - [ErrAcceptorUninitialized] when the acceptor was not created with [NewAcceptor].
+//   - [ErrAcceptorStateNotStopped] when the acceptor is not in the stopped state.
+//   - The error from [net.ListenTCP] when binding fails; the acceptor stays stopped.
+//
+// Notes:
+//   - Blocks until the accept goroutine is running, so [Acceptor.ListenAddrPort] returns
+//     the bound address as soon as Start returns.
 func (this *Acceptor) Start() error {
-	if this.lifecycleState == nil {
+	if this.state == nil {
 		return ErrAcceptorUninitialized
 	}
 
-	if err := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != AcceptorStateStop {
-			return ErrAcceptorStateNotStop
+	if err := this.state.Access(func(state *internal.StateGuardType) error {
+		if *state != AcceptorStateStopped {
+			return ErrAcceptorStateNotStopped
 		}
 
-		this.startedSignal = internal.NewSignal()
-		this.stoppedSignal = internal.NewSignal()
+		this.started = internal.NewSignal()
+		this.stopped = internal.NewSignal()
 
 		if this.listener != nil {
 			this.listener.Close()
@@ -142,37 +143,43 @@ func (this *Acceptor) Start() error {
 		listenAddrPort := listener.Addr().(*net.TCPAddr).AddrPort()
 		this.listenAddrPort.Store(&listenAddrPort)
 
-		*state = AcceptorStateWaitRun
+		*state = AcceptorStateWaitRunning
 		return nil
 	}); err != nil {
 		return err
 	}
 
 	go this.run()
-	this.startedSignal.Wait()
+	this.started.Wait()
 	return nil
 }
 
-// run is the accept loop that accepts connections and requests registration through
-// acceptedConnection.
-// It transitions from WaitRun to Run and then sends the start signal.
-// Errors other than net.ErrClosed are passed to reportError, and the loop continues.
-// When the listener is closed and it receives net.ErrClosed, it sends the stop signal and returns.
+// run is the accept loop goroutine. It sets state to [AcceptorStateRunning], calls started.Signal(), and
+// loops on listener.AcceptTCP() until [Acceptor.Stop] closes listener.
+//
+// Notes:
+//   - Started as "go this.run()" by [Acceptor.Start].
+//   - When state is not [AcceptorStateWaitRunning] on entry, [ErrAcceptorStateNotWaitRunning] is passed to
+//     [Acceptor.reportError] and run returns without calling started.Signal or stopped.Signal.
+//   - When AcceptTCP returns an error for which errors.Is(err, [net.ErrClosed]) is true, run returns.
+//     Any other AcceptTCP error is passed to reportError and the loop continues.
+//   - Each accepted *net.TCPConn is passed to [Acceptor.acceptedConnection] on this goroutine.
+//   - stopped.Signal() runs on return through defer.
 func (this *Acceptor) run() {
-	if err := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != AcceptorStateWaitRun {
-			return ErrAcceptorStateNotWaitRun
+	if err := this.state.Access(func(state *internal.StateGuardType) error {
+		if *state != AcceptorStateWaitRunning {
+			return ErrAcceptorStateNotWaitRunning
 		}
 
-		*state = AcceptorStateRun
+		*state = AcceptorStateRunning
 		return nil
 	}); err != nil {
 		this.reportError(err)
 		return
 	}
 
-	defer this.stoppedSignal.Signal()
-	this.startedSignal.Signal()
+	defer this.stopped.Signal()
+	this.started.Signal()
 
 	listenAddrPort := this.listener.Addr().(*net.TCPAddr).AddrPort()
 	for {
@@ -182,7 +189,7 @@ func (this *Acceptor) run() {
 		}
 
 		if err != nil {
-			// AcceptTCP errors such as exceeding the FD limit are passed on, and it continues.
+
 			this.reportError(err)
 			continue
 		}
@@ -191,59 +198,70 @@ func (this *Acceptor) run() {
 	}
 }
 
-// RequestStop transitions the Run state to WaitStop.
-// It closes the listener to request that the accept loop end.
-// Even if closing the listener fails, it transitions to WaitStop and returns the close error.
+// Stop stops accepting connections.
 //
-// It returns ErrAcceptorUninitialized if not initialized, ErrAcceptorStateNotRun if not in the Run
-// state, and the listener close error if closing the listener fails.
-func (this *Acceptor) RequestStop() error {
-	if this.lifecycleState == nil {
+// Returns:
+//   - nil when the listener was closed.
+//   - [ErrAcceptorUninitialized] when the acceptor was not created with [NewAcceptor].
+//   - [ErrAcceptorStateNotRunning] when the acceptor is not running.
+//   - The error from closing the listener; the state still moves to WaitStopped.
+//
+// Notes:
+//   - Returns without waiting for the accept goroutine. Call [Acceptor.WaitStopped] to wait
+//     and return to the stopped state.
+func (this *Acceptor) Stop() error {
+	if this.state == nil {
 		return ErrAcceptorUninitialized
 	}
 
-	return this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != AcceptorStateRun {
-			return ErrAcceptorStateNotRun
+	return this.state.Access(func(state *internal.StateGuardType) error {
+		if *state != AcceptorStateRunning {
+			return ErrAcceptorStateNotRunning
 		}
 
 		err := this.listener.Close()
-		*state = AcceptorStateWaitStop
+		*state = AcceptorStateWaitStopped
 		return err
 	})
 }
 
-// WaitStop waits for the accept loop to end in the WaitStop state and then transitions to Stop.
+// WaitStopped blocks until the accept goroutine has exited after [Acceptor.Stop], then
+// moves the acceptor to the stopped state so it can be started again.
 //
-// It returns ErrAcceptorUninitialized if not initialized, and ErrAcceptorStateNotWaitStop if not in
-// the WaitStop state.
-func (this *Acceptor) WaitStop() error {
-	if this.lifecycleState == nil {
+// Returns:
+//   - nil when the acceptor is stopped.
+//   - [ErrAcceptorUninitialized] when the acceptor was not created with [NewAcceptor].
+//   - [ErrAcceptorStateNotWaitStopped] when [Acceptor.Stop] has not been called, or WaitStopped already returned.
+func (this *Acceptor) WaitStopped() error {
+	if this.state == nil {
 		return ErrAcceptorUninitialized
 	}
 
-	if err := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != AcceptorStateWaitStop {
-			return ErrAcceptorStateNotWaitStop
+	if err := this.state.Access(func(state *internal.StateGuardType) error {
+		if *state != AcceptorStateWaitStopped {
+			return ErrAcceptorStateNotWaitStopped
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
 
-	this.stoppedSignal.Wait()
-	err := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		*state = AcceptorStateStop
+	this.stopped.Wait()
+	return this.state.Access(func(state *internal.StateGuardType) error {
+		*state = AcceptorStateStopped
 		return nil
 	})
-
-	return err
 }
 
-// ListenAddrPort returns the stored listen address.
-// After Start succeeds, it returns the actual bound address.
+// ListenAddrPort returns the listen address.
 //
-// It returns the listen address and port.
+// Returns:
+//   - Before the first [Acceptor.Start], the address passed to [NewAcceptor].
+//   - After a successful Start, the address actually bound, with port 0 replaced by the assigned port.
+//   - A zero [netip.AddrPort] for a zero-value Acceptor.
+//
+// Notes:
+//   - Safe to call from any goroutine without blocking.
 func (this *Acceptor) ListenAddrPort() netip.AddrPort {
 	listenAddrPortPtr := this.listenAddrPort.Load()
 	if listenAddrPortPtr == nil {
@@ -253,13 +271,19 @@ func (this *Acceptor) ListenAddrPort() netip.AddrPort {
 	return *listenAddrPortPtr
 }
 
-// netTCPConnToFileDescriptor duplicates the socket FD of the connection with F_DUPFD_CLOEXEC and
-// returns it.
-// The original connection and the duplicated FD must each be closed.
+// netTCPConnToFileDescriptor duplicates the socket of netTCPConn with fcntl(F_DUPFD_CLOEXEC) through
+// netTCPConn.SyscallConn().Control, so the socket stays open after netTCPConn.Close.
 //
-//   - netTCPConn: accepted TCP connection
+// Parameters:
+//   - netTCPConn is the connection returned by listener.AcceptTCP.
 //
-// It returns the duplicated FD on success, and -1 and an error on failure.
+// Returns:
+//   - The duplicated descriptor and nil.
+//   - -1 and the SyscallConn error, or the Control error.
+//   - -1 and os.NewSyscallError("fcntl", errno) when the fcntl call fails.
+//
+// Notes:
+//   - The duplicate has FD_CLOEXEC set and shares the non-blocking mode the net package set on the socket.
 func netTCPConnToFileDescriptor(netTCPConn *net.TCPConn) (FileDescriptor, error) {
 	rawConn, rawError := netTCPConn.SyscallConn()
 	if rawError != nil {
@@ -281,15 +305,23 @@ func netTCPConnToFileDescriptor(netTCPConn *net.TCPConn) (FileDescriptor, error)
 	return FileDescriptor(duplicated), nil
 }
 
-// acceptedConnection duplicates the FD of the accepted connection, creates a Handler with factory,
-// and calls acceptedCallback.
-// It always closes the original connection when returning. The socket itself is not closed.
-// FD duplication failure, factory errors, and nil or typed nil Handlers are rejected with
-// rejectConnection.
-// If acceptedCallback is nil or returns an error, it is rejected with rejectAcceptedCallback.
+// acceptedConnection calls [netTCPConnToFileDescriptor], factory(fd, listenAddrPort), and
+// acceptedCallback(handler) for one accepted connection.
 //
-//   - netTCPConn: accepted TCP connection
-//   - listenAddrPort: listen address that accepted the connection, passed to factory
+// Parameters:
+//   - netTCPConn is the connection from listener.AcceptTCP. netTCPConn.Close() runs on return through defer.
+//   - listenAddrPort is the address bound by listener, passed to factory.
+//
+// Notes:
+//   - On success fd belongs to the handler's [HandlerContext]; only netTCPConn is closed.
+//   - When netTCPConnToFileDescriptor or factory returns an error, [Acceptor.rejectConnection](netTCPConn,
+//     fd, err) closes fd and reports err.
+//   - When factory returns a nil interface, rejectConnection is called with reason nil, so nothing is
+//     reported unless closing fails. When it returns a typed nil pointer, detected with reflect,
+//     rejectConnection is called with [ErrAcceptorInvalidHandler].
+//   - When acceptedCallback is nil, [Acceptor.rejectAcceptedCallback] is called with
+//     [ErrAcceptorNilAcceptedCallback]. When acceptedCallback returns an error, rejectAcceptedCallback is
+//     called with that error.
 func (this *Acceptor) acceptedConnection(netTCPConn *net.TCPConn, listenAddrPort netip.AddrPort) {
 	defer func() {
 		netTCPConn.Close()
@@ -329,16 +361,20 @@ func (this *Acceptor) acceptedConnection(netTCPConn *net.TCPConn, listenAddrPort
 	}
 }
 
-// rejectAcceptedCallback handles the rejection.
-// If there is a HandlerContext and the FD is valid, it closes the duplicated FD with SO_LINGER 0
-// through abortConnection.
-// If HandlerContext is nil or the FD is negative, it rejects with rejectConnection.
-// The rejection reason and cleanup errors are passed to the error callback.
+// rejectAcceptedCallback drops a connection whose handler was created by factory but not accepted by
+// acceptedCallback.
 //
-//   - netTCPConn: accepted original connection
-//   - fd: duplicated FD
-//   - handler: Handler to reject
-//   - reason: rejection reason
+// Parameters:
+//   - netTCPConn is the accepted connection.
+//   - fd is the descriptor given to factory.
+//   - handler is the handler returned by factory. Must not be nil.
+//   - reason is the acceptedCallback error or [ErrAcceptorNilAcceptedCallback].
+//
+// Notes:
+//   - When handler.context() is not nil and handler.context().fileDescriptor() >= 0, the context owns fd:
+//     [HandlerContext.abortConnection] closes it with RST and errors.Join(reason, abort error) is passed to
+//     [Acceptor.reportError].
+//   - Otherwise [Acceptor.rejectConnection](netTCPConn, fd, reason) closes fd and netTCPConn.
 func (this *Acceptor) rejectAcceptedCallback(netTCPConn *net.TCPConn, fd FileDescriptor, handler ClientHandler, reason error) {
 	context := handler.context()
 	if context == nil || context.fileDescriptor() < 0 {
@@ -349,13 +385,17 @@ func (this *Acceptor) rejectAcceptedCallback(netTCPConn *net.TCPConn, fd FileDes
 	this.reportError(errors.Join(reason, context.abortConnection()))
 }
 
-// rejectConnection sets Linger of the original connection to 0 and closes it, and closes the
-// duplicated FD if it is valid.
-// The rejection reason and cleanup errors are passed to the error callback.
+// rejectConnection calls syscall.Close(fd) when fd >= 0, then netTCPConn.SetLinger(0) and netTCPConn.Close(),
+// so the peer receives RST.
 //
-//   - netTCPConn: accepted original connection
-//   - fd: duplicated FD, which is -1 and is not closed if duplication failed
-//   - reason: rejection reason, nil allowed
+// Parameters:
+//   - netTCPConn is the accepted connection.
+//   - fd is the duplicated descriptor. Negative means [netTCPConnToFileDescriptor] failed and there is none.
+//   - reason is the rejection cause. nil means nothing is reported unless a close fails.
+//
+// Notes:
+//   - errors.Join(reason, SetLinger error, Close error, syscall.Close error) is passed to
+//     [Acceptor.reportError], which drops it when every element is nil.
 func (this *Acceptor) rejectConnection(netTCPConn *net.TCPConn, fd FileDescriptor, reason error) {
 	var closeError error
 	if fd >= 0 {
@@ -365,9 +405,13 @@ func (this *Acceptor) rejectConnection(netTCPConn *net.TCPConn, fd FileDescripto
 	this.reportError(errors.Join(reason, netTCPConn.SetLinger(0), netTCPConn.Close(), closeError))
 }
 
-// reportError passes err to the error callback if the callback exists and err is not nil.
+// reportError calls errorCallback(err).
 //
-//   - err: error to pass
+// Parameters:
+//   - err is the AcceptTCP error or the rejection error.
+//
+// Notes:
+//   - Returns without calling when err is nil or errorCallback is nil.
 func (this *Acceptor) reportError(err error) {
 	if this.errorCallback == nil || err == nil {
 		return

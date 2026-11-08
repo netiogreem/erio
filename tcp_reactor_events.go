@@ -8,12 +8,23 @@ import (
 	"github.com/netiogreem/erio/internal"
 )
 
-// handleEvent processes the epoll events of a registered Handler in the order of read, write,
-// error, read close (EPOLLRDHUP without EPOLLHUP), and hangup (EPOLLHUP).
+// handleEvent dispatches one epoll event to handlers[fd].
 //
-//   - fd: file descriptor on which the event occurred.
-//   - event: event delivered by epoll.
-func (this *TCPReactor) handleEvent(fd internal.FileDescriptor, event syscall.EpollEvent) {
+// Parameters:
+//   - fd is the file descriptor from event.Fd. Returns when handlers has no entry for it.
+//   - event is the epoll event; event.Events selects which handleEvent* functions run.
+//
+// Notes:
+//   - When event.Events has EPOLLHUP, handler.context().setClosed() is called first, before any other flag
+//     is handled, and [tcpReactor.handleEventHangup] runs last.
+//   - The flags are handled in the order EPOLLIN ([tcpReactor.handleEventReadable]), EPOLLOUT
+//     ([tcpReactor.handleEventWritable]), EPOLLERR ([tcpReactor.handleEventError]), EPOLLRDHUP
+//     ([tcpReactor.handleEventReadHangup]), EPOLLHUP ([tcpReactor.handleEventHangup]).
+//   - handleEventReadable gets readAll true when EPOLLHUP or EPOLLRDHUP is set, so the kernel buffer is
+//     read in one pass before the hangup is handled.
+//   - handleEventReadHangup runs only when EPOLLRDHUP is set and EPOLLHUP is not.
+//   - handleEventWritable gets isClosed true when EPOLLHUP is set.
+func (this *tcpReactor) handleEvent(fd internal.FileDescriptor, event syscall.EpollEvent) {
 	handler, contains := this.handlers[fd]
 	if !contains {
 		return
@@ -21,8 +32,7 @@ func (this *TCPReactor) handleEvent(fd internal.FileDescriptor, event syscall.Ep
 
 	isClosed := false
 	if event.Events&syscall.EPOLLHUP != 0 {
-		// It is recorded first so that the receive callback for the remaining data can also check
-		// the closed state.
+
 		handler.context().setClosed()
 		isClosed = true
 	}
@@ -49,15 +59,16 @@ func (this *TCPReactor) handleEvent(fd internal.FileDescriptor, event syscall.Ep
 	}
 }
 
-// handleEventReadable runs the receive processing of the ClientHandler with the receive buffer of
-// this Reactor.
-// If read returns 0, it removes only the read event (EPOLLIN) from monitoring.
+// handleEventReadable calls handler.context().onReadable(readAll, readBuffer).
 //
-//   - handler: ClientHandler on which the read event occurred.
-//   - readAll: true if EPOLLHUP or EPOLLRDHUP was delivered together. If true, it keeps reading
-//     until read returns 0 (EOF), EAGAIN, or an error, so that the data received before the FIN
-//     reaches OnRead before the read close or hangup is processed.
-func (this *TCPReactor) handleEventReadable(handler ClientHandler, readAll bool) {
+// Parameters:
+//   - handler is handlers[fd] for the socket that reported EPOLLIN.
+//   - readAll is passed to [HandlerContext.onReadable]. true makes it read until the socket is drained.
+//
+// Notes:
+//   - When onReadable returns true (read returned 0, the peer closed), epoller.UnregisterRead(fd) disarms
+//     EPOLLIN. The UnregisterRead error is passed to [tcpReactor.handleError].
+func (this *tcpReactor) handleEventReadable(handler ClientHandler, readAll bool) {
 	if handler.context().onReadable(readAll, this.readBuffer) == true {
 		if err := this.epoller.UnregisterRead(handler.context().fileDescriptor()); err != nil {
 			this.handleError(err)
@@ -65,16 +76,27 @@ func (this *TCPReactor) handleEventReadable(handler ClientHandler, readAll bool)
 	}
 }
 
-// handleEventWritable handles write events for the ClientHandler.
-// If data remains to be sent while handling a write event, it keeps the
-// write event (EPOLLOUT) registered so that the next write event is received.
-// If no data remains to be sent, it removes the write event, and if Close or AbortiveClose was
-// requested, it enqueues the unregister command as the close event.
+// handleEventWritable calls handler.context().onWritable() to write writeBuffer to the socket.
 //
-//   - handler: ClientHandler on which the write event occurred.
-//   - isClosed: true if EPOLLHUP was delivered together. If true, it removes the write event
-//     without sending, because handleEventHangup removes the connection in the same event.
-func (this *TCPReactor) handleEventWritable(handler ClientHandler, isClosed bool) {
+// Parameters:
+//   - handler is handlers[fd] for the socket that reported EPOLLOUT.
+//   - isClosed is true when the same event had EPOLLHUP. epoller.UnregisterWrite(fd) is then called
+//     without writing.
+//
+// Notes:
+//   - When onWritable returns true (data remains), EPOLLOUT stays armed and nothing else is done.
+//   - When onWritable returns false, epoller.UnregisterWrite(fd) disarms EPOLLOUT.
+//   - When onWritable returned false and [HandlerContext.isDrainedForClose] is true,
+//     [tcpReactor.removeHandler] is not called here. Instead commands.EnqueueUnregisterHandler(handler,
+//     [ErrTCPReactorCloseRequested], handler.context().IsAbortiveClosed()) is called. The loop later drains
+//     that command in [tcpReactor.handleCommands] and runs [tcpReactor.handleCommandUnregisterHandler], which
+//     calls removeHandler: the socket is closed and [ClientHandler.OnClose] receives
+//     [ErrTCPReactorCloseRequested]. Commands for this handler that were queued earlier are drained first.
+//   - The EnqueueUnregisterHandler error is ignored. Calling removeHandler here would skip those earlier
+//     commands. The handler is removed later by [tcpReactor.handleEventHangup], by
+//     [tcpReactor.handleTimeouts] when abortiveCloseDeadline passes, or by [tcpReactor.cleanup].
+//   - An UnregisterWrite error is passed to [tcpReactor.handleError].
+func (this *tcpReactor) handleEventWritable(handler ClientHandler, isClosed bool) {
 	if isClosed == true {
 		if err := this.epoller.UnregisterWrite(handler.context().fileDescriptor()); err != nil {
 			this.handleError(err)
@@ -97,11 +119,16 @@ func (this *TCPReactor) handleEventWritable(handler ClientHandler, isClosed bool
 	}
 }
 
-// handleEventError retrieves the pending error of the socket and passes it to the ClientHandler.
-// If retrieving the error itself fails, it is passed to the Reactor error callback.
+// handleEventError reads SO_ERROR of the socket with syscall.GetsockoptInt and reports it to the handler.
 //
-//   - handler: ClientHandler on which the error event occurred.
-func (this *TCPReactor) handleEventError(handler ClientHandler) {
+// Parameters:
+//   - handler is handlers[fd] for the socket that reported EPOLLERR.
+//
+// Notes:
+//   - When SO_ERROR is not 0, handler.OnError receives it as [syscall.Errno].
+//   - When GetsockoptInt itself fails, its error is wrapped as "fd %d: getsockopt" and passed to
+//     [tcpReactor.handleError]. handler.OnError is not called.
+func (this *tcpReactor) handleEventError(handler ClientHandler) {
 	fd := handler.context().fileDescriptor()
 
 	socketError, optionError := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_ERROR)
@@ -115,20 +142,28 @@ func (this *TCPReactor) handleEventError(handler ClientHandler) {
 	}
 }
 
-// handleEventHangup removes the ClientHandler on which a disconnection occurred.
+// handleEventHangup calls [tcpReactor.removeHandler](handler, [ErrTCPReactorHangup], false).
 //
-//   - handler: ClientHandler to remove.
-func (this *TCPReactor) handleEventHangup(handler ClientHandler) {
+// Parameters:
+//   - handler is handlers[fd] for the socket that reported EPOLLHUP.
+//
+// Notes:
+//   - soLinger false closes the socket with [HandlerContext.closeConnection], and [ClientHandler.OnClose]
+//     receives [ErrTCPReactorHangup] as closeReason.
+func (this *tcpReactor) handleEventHangup(handler ClientHandler) {
 	this.removeHandler(handler, ErrTCPReactorHangup, false)
 }
 
-// handleEventReadHangup stops monitoring EPOLLRDHUP of the ClientHandler whose peer closed its
-// sending side and calls OnReadClose.
-// If removing the monitoring fails, it returns immediately and retries when EPOLLRDHUP is
-// delivered again at the next epoll wait.
+// handleEventReadHangup calls epoller.UnregisterReadHangup(fd) and then handler.OnReadClose.
 //
-//   - handler: ClientHandler whose peer closed its sending side.
-func (this *TCPReactor) handleEventReadHangup(handler ClientHandler) {
+// Parameters:
+//   - handler is handlers[fd] for the socket that reported EPOLLRDHUP without EPOLLHUP, that is, the peer
+//     shut down its write side.
+//
+// Notes:
+//   - When UnregisterReadHangup returns an error, it is passed to [tcpReactor.handleError] and OnReadClose
+//     is not called.
+func (this *tcpReactor) handleEventReadHangup(handler ClientHandler) {
 	if err := this.epoller.UnregisterReadHangup(handler.context().fileDescriptor()); err != nil {
 		this.handleError(err)
 		return
@@ -137,16 +172,25 @@ func (this *TCPReactor) handleEventReadHangup(handler ClientHandler) {
 	handler.OnReadClose(handler.context())
 }
 
-// removeHandler removes the ClientHandler from this Reactor and closes the connection.
-// It records the closed state, removes the Handler from the mailbox registry, the client timer,
-// epoll monitoring, and the Handler map, decreases the Handler counter, closes the connection with
-// FIN or RST, and then calls OnClose.
+// removeHandler detaches handler from the reactor, closes the socket, and calls handler.OnClose.
 //
-//   - handler: registered Handler to remove from this Reactor.
-//   - closeReason: connection close reason to pass to OnClose.
-//   - soLinger: if true, it sets SO_LINGER 0 and closes the connection with RST (AbortiveClose and
-//     the abortive close timeout); if false, it closes the connection without changing SO_LINGER.
-func (this *TCPReactor) removeHandler(handler ClientHandler, closeReason error, soLinger bool) {
+// Parameters:
+//   - handler is the handler to remove. It must be handlers[handler.context().fileDescriptor()].
+//   - closeReason is passed to [ClientHandler.OnClose] as closeReason.
+//   - soLinger true calls [HandlerContext.abortConnection] (SO_LINGER 0, RST); false calls
+//     [HandlerContext.closeConnection].
+//
+// Notes:
+//   - The order is: handler.context().setClosed(), commands.UnregisterHandler(handler),
+//     clientTimer.Unregister(handler), epoller.Unregister(fd), delete(handlers, fd),
+//     handlerCounter.Add(^uint32(0)), abortConnection or closeConnection, handler.OnClose.
+//   - The epoller.Unregister error and the abortConnection or closeConnection error are passed to
+//     [tcpReactor.handleError].
+//
+// Caution:
+//   - handlerCounter.Add(^uint32(0)) runs unconditionally, so calling this for a handler not in handlers
+//     makes the count wrong.
+func (this *tcpReactor) removeHandler(handler ClientHandler, closeReason error, soLinger bool) {
 	fd := handler.context().fileDescriptor()
 
 	handler.context().setClosed()

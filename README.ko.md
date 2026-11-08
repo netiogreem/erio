@@ -332,7 +332,7 @@ func (this *MyHandler) OnWake(context *erio.HandlerContext) {
   * ReactorParam
     * Count: Reactor의 개수 입니다.
     * EventBatchSize: epoll 대기시 한번에 받을 최대 이벤트 수 입니다.
-    * RegisterCommandQuota: Reactor에 등록할 수 있는 대기열 한도 입니다.
+    * RegisterCommandQuota: 이벤트 루프 한 바퀴 동안 받아주는 RegisterHandler 요청 수 입니다. 넘으면 RegisterHandler가 ErrCommandMailboxRegisterQuotaExceeded를 반환하고 Acceptor가 그 연결을 거절합니다.
     * CommandReserveSize: 명령 대기열의 예약 크기 입니다.
     * ReadBufferSize: Reactor별 수신 버퍼의 크기 입니다.
     * ErrorCallback: Reactor 오류 콜백 함수 입니다.
@@ -382,7 +382,7 @@ func (this *Builder) Build() (server *TCPServer, err error)
 
 * Builder.Build()로 생성하며, 연결 수락과 Reactor들의 시작·종료를 관리합니다.
 * Start()는 모든 Reactor를 시작한 뒤 리스닝을 시작합니다.
-* Stop()은 새로운 연결 수락을 중단하고 모든 Reactor를 종료한 뒤 종료 완료를 기다리고, epoll과 eventfd 자원을 해제합니다. 종료 결과와 관계없이 nil을 반환합니다.
+* Stop()은 새로운 연결 수락을 중단하고 모든 Reactor를 종료한 뒤 종료 완료를 기다리고, epoll과 eventfd 자원을 해제합니다. Running 상태가 아니면 ErrTCPServerStateNotRunning을 반환하고, 그 외에는 종료 결과와 관계없이 nil을 반환합니다.
 * 리스닝 주소의 인덱스는 등록 순서대로 0부터 시작합니다. 포트를 0으로 지정했다면 Start() 성공 후 실제 할당된 포트를 조회할 수 있습니다.
 
 ```go
@@ -408,7 +408,7 @@ erio는 **On{Event}(완료 콜백 함수) 구조와 같은 콜백에만 의존�
 * 사용자는 연결당 생성되는 ClientHandler 인터페이스를 구현해야 합니다.
 * ClientHandler는 외부 고루틴에서 사용해서는 안됩니다.
   * 외부 고루틴에서 명령 전달이 필요한 경우 ClientHandler가 가진 HandlerContext를 안전하게 사용할 수 있습니다.
-* ClientHandler는 오롯이 TCPReactor의 고루틴에서만 호출되어 집니다.
+* ClientHandler의 콜백은 TCPReactor의 고루틴에서만 호출됩니다.
 
 ```Go
 package erio
@@ -569,7 +569,7 @@ func (this *HandlerContext) Wake() error
 
 // 먼저 닫힘 상태를 기록하고 Reactor로 Close를 요청합니다.
 // Write로 송신 요청된 데이터를 모두 전송하고 Close합니다.
-// abortiveCloseTimeout(0) 으로 설정되지 않은 경우 송신 완료때까지 Close하지 않습니다.
+// abortiveCloseTimeout이 0이면 송신 완료때까지 Close하지 않습니다.
 // abortiveCloseTimeout가 설정된 경우 abortiveCloseTimeout 내에 데이터가 전송되지 않으면 강제 종료(RST) 방식으로 연결이 닫힙니다.
 func (this *HandlerContext) Close() error
 
@@ -577,6 +577,15 @@ func (this *HandlerContext) Close() error
 // 이미 Close() 요청으로 남은 데이터 송신을 기다리는 중에도 요청할 수 있습니다.
 // OnWritten으로 완료를 알린 데이터라도 상대방에게 전달되지 않았으면 버려집니다.
 func (this *HandlerContext) AbortiveClose() error
+
+// ClientHandler.OnUserEvent의 기본 구현입니다. 아무 일도 하지 않습니다.
+func (this *HandlerContext) OnUserEvent(context *HandlerContext, userEventData any)
+
+// ClientHandler.OnWake의 기본 구현입니다. 아무 일도 하지 않습니다.
+func (this *HandlerContext) OnWake(context *HandlerContext)
+
+// ClientHandler.OnTimeout의 기본 구현입니다. 아무 일도 하지 않습니다.
+func (this *HandlerContext) OnTimeout(context *HandlerContext, timerKey uint64)
 
 // ClientHandler.OnReadClose의 기본 구현입니다. Close를 요청합니다.
 func (this *HandlerContext) OnReadClose(context *HandlerContext)

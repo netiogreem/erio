@@ -5,11 +5,22 @@ import (
 	"time"
 )
 
-// handleCommands processes the commands drained from the Mailbox in order.
+// handleCommands calls commands.Drain(handleError) and dispatches each command by commandType to the
+// matching handleCommand* function.
 //
-// isStop is true if a stop command was received, and the commands drained together with it are
-// still processed.
-func (this *TCPReactor) handleCommands() (isStop bool) {
+// Returns:
+//   - true when a commandStop was in the batch.
+//   - false otherwise.
+//
+// Notes:
+//   - commandStop sets isStop and the remaining commands in the batch are still dispatched.
+//   - A command whose handler is nil is passed to [tcpReactor.handleError] as [ErrTCPReactorNilHandler] and skipped.
+//   - For every commandType except commandRegisterHandler, the command is skipped when
+//     handlers[command.handler.context().fileDescriptor()] is missing or is a different handler. This is how
+//     commands queued for a handler that [tcpReactor.removeHandler] already removed are discarded.
+//   - A command with an unknown commandType is passed to handleError as [ErrTCPReactorCommand].
+//   - The drained slice is cleared at the end because [commandMailbox.Drain] reuses it.
+func (this *tcpReactor) handleCommands() (isStop bool) {
 	isStop = false
 
 	commands := this.commands.Drain(this.handleError)
@@ -68,16 +79,25 @@ func (this *TCPReactor) handleCommands() (isStop bool) {
 	return isStop
 }
 
-// handleCommandRegisterHandler binds the handler and registers the read and hangup events.
-// If the registration fails, it calls OnError and removes the Handler from the mailbox registry.
-// If the FD is negative, already used by a registered Handler, or equal to the command FD, it does
-// not close the connection; if binding or registering the epoll events fails, it closes the
-// connection with RST.
+// handleCommandRegisterHandler calls handler.context().bind, epoller.RegisterReadWithHangup(fd), adds handler to
+// handlers, increments handlerCounter, and calls handler.OnConnect.
 //
-//   - handler: Handler enqueued with the registration command.
+// Parameters:
+//   - handler is command.handler of a commandRegisterHandler. Its socket is open and not yet in handlers.
 //
-// It returns the registration failure, or nil on success.
-func (this *TCPReactor) handleCommandRegisterHandler(handler ClientHandler) (err error) {
+// Returns:
+//   - nil when handler was added to handlers and OnConnect was called.
+//   - [ErrTCPReactorInvalidFileDescriptor] when handler.context().fileDescriptor() is negative.
+//   - [ErrTCPReactorDuplicateFD] when handlers already has that file descriptor or it equals commandFD.
+//   - The [HandlerContext.bind] error or the epoller.RegisterReadWithHangup error.
+//
+// Notes:
+//   - On every error handler.OnError receives it, and the deferred commands.UnregisterHandler(handler) stops
+//     accepting commands for the handler. OnConnect and OnClose are not called.
+//   - On ErrTCPReactorInvalidFileDescriptor and ErrTCPReactorDuplicateFD the socket is left open. On a bind
+//     or RegisterReadWithHangup error [tcpReactor.rejectHandler] closes it with RST.
+//   - [tcpReactor.handleCommands] discards the return value.
+func (this *tcpReactor) handleCommandRegisterHandler(handler ClientHandler) (err error) {
 	fd := handler.context().fileDescriptor()
 
 	defer func() {
@@ -114,15 +134,18 @@ func (this *TCPReactor) handleCommandRegisterHandler(handler ClientHandler) (err
 	return nil
 }
 
-// handleCommandUnregisterHandler processes the close event and removes the Handler.
-// If AbortiveClose was requested by the time this command is processed, it closes the connection
-// with RST and ErrTCPReactorAbortiveClose regardless of the reason and soLinger in the command.
+// handleCommandUnregisterHandler calls [tcpReactor.removeHandler] for a commandUnregisterHandler.
 //
-//   - handler: Handler to remove, and the command is ignored if it differs from the currently
-//     registered object.
-//   - reason: close reason to pass to OnClose.
-//   - soLinger: if true, it closes the connection with RST.
-func (this *TCPReactor) handleCommandUnregisterHandler(handler ClientHandler, reason error, soLinger bool) {
+// Parameters:
+//   - handler is command.handler.
+//   - reason is command.reason, passed to removeHandler as closeReason.
+//   - soLinger is command.soLinger, passed to removeHandler.
+//
+// Notes:
+//   - When handler.context().IsAbortiveClosed() is true, removeHandler is called with
+//     [ErrTCPReactorAbortiveClose] and soLinger true instead, so an AbortiveClose requested after the
+//     command was queued still wins.
+func (this *tcpReactor) handleCommandUnregisterHandler(handler ClientHandler, reason error, soLinger bool) {
 	if handler.context().IsAbortiveClosed() {
 		this.removeHandler(handler, ErrTCPReactorAbortiveClose, handler.context().IsAbortiveClosed())
 		return
@@ -130,65 +153,80 @@ func (this *TCPReactor) handleCommandUnregisterHandler(handler ClientHandler, re
 	this.removeHandler(handler, reason, soLinger)
 }
 
-// rejectHandler reports the registration failure through OnError and immediately closes the
-// handed-over connection.
+// rejectHandler calls handler.context().setClosed() and handler.context().abortConnection(), then passes
+// errors.Join(abort error, reason) to handler.OnError.
 //
-//   - handler: Handler whose registration failed.
-//   - reason: reason for the registration failure.
-func (this *TCPReactor) rejectHandler(handler ClientHandler, reason error) {
+// Parameters:
+//   - handler is the handler whose registration failed.
+//   - reason is the registration error.
+//
+// Caution:
+//   - Call only for handlers that were never added to handlers. handlers, handlerCounter, clientTimer, and
+//     epoller are not touched, and [ClientHandler.OnClose] is not called.
+func (this *tcpReactor) rejectHandler(handler ClientHandler, reason error) {
 	handler.context().setClosed()
 	handler.OnError(handler.context(), errors.Join(handler.context().abortConnection(), reason))
 }
 
-// handleCommandSetTimeout sets the per-key timer of the currently registered Handler and updates
-// the next expiration time.
+// handleCommandSetTimeout calls handler.context().onSetTimeout(timerKey, expiresAt) and passes its result to
+// [tcpReactor.updateClientTimer].
 //
-//   - handler: target of the timer setting, and the command is ignored if it differs from the
-//     currently registered object.
-//   - timerKey: key of the timer to set or replace.
-//   - expiresAt: timer expiration time.
-func (this *TCPReactor) handleCommandSetTimeout(handler ClientHandler, timerKey uint64, expiresAt time.Time) {
+// Parameters:
+//   - handler is command.handler.
+//   - timerKey is command.timerKey, the key given to [HandlerContext.SetTimeout].
+//   - expiresAt is command.expiresAt, the time computed by [HandlerContext.SetTimeout].
+func (this *tcpReactor) handleCommandSetTimeout(handler ClientHandler, timerKey uint64, expiresAt time.Time) {
 	nextExpiration, hasTimer := handler.context().onSetTimeout(timerKey, expiresAt)
 	this.updateClientTimer(handler, nextExpiration, hasTimer)
 }
 
-// handleCommandUnsetTimeout unsets the per-key timer of the currently registered Handler and
-// updates the next expiration time.
+// handleCommandUnsetTimeout calls handler.context().onUnsetTimeout(timerKey) and passes its result to
+// [tcpReactor.updateClientTimer].
 //
-//   - handler: target of the timer unset, and the command is ignored if it differs from the
-//     currently registered object.
-//   - timerKey: key of the timer to unset.
-func (this *TCPReactor) handleCommandUnsetTimeout(handler ClientHandler, timerKey uint64) {
+// Parameters:
+//   - handler is command.handler.
+//   - timerKey is command.timerKey, the key given to [HandlerContext.UnsetTimeout].
+func (this *tcpReactor) handleCommandUnsetTimeout(handler ClientHandler, timerKey uint64) {
 	nextExpiration, hasTimer := handler.context().onUnsetTimeout(timerKey)
 	this.updateClientTimer(handler, nextExpiration, hasTimer)
 }
 
-// handleCommandWrite registers write monitoring (EPOLLOUT) for the Handler.
-// When a write event occurs, handleEventWritable sends the data and OnWritten is called.
-// If the registration fails, it calls OnError.
+// handleCommandWrite calls epoller.RegisterWrite(fd) so [tcpReactor.handleEventWritable] writes the
+// handler's writeBuffer on the next EPOLLOUT.
 //
-//   - handler: target of the transmission, and the command is ignored if it differs from the
-//     currently registered object.
-func (this *TCPReactor) handleCommandWrite(handler ClientHandler) {
+// Parameters:
+//   - handler is command.handler of a commandWrite queued by [HandlerContext.Write] outside the immediate
+//     write window.
+//
+// Notes:
+//   - The RegisterWrite error is passed to handler.OnError.
+func (this *tcpReactor) handleCommandWrite(handler ClientHandler) {
 	if err := this.epoller.RegisterWrite(handler.context().fileDescriptor()); err != nil {
 		handler.OnError(handler.context(), err)
 	}
 }
 
-// handleCommandClose processes the Close request.
-// If no write data remains, it enqueues the unregister command as the close event.
-// If data remains, it does not send the data itself; it sets the abortive close deadline when
-// abortiveCloseTimeout is greater than 0, registers the next expiration in the client timer, and
-// handleEventWritable or writeImmediately sends the remaining data and enqueues the close event.
-// If AbortiveClose was requested after Close, it does nothing and the following abortive close
-// command closes it.
-// If enqueuing the close event fails, it calls OnError and removes the Handler immediately.
+// handleCommandClose handles the commandClose queued by [HandlerContext.Close].
 //
-//   - handler: target of the close, and the command is ignored if it differs from the currently
-//     registered object.
-//   - abortiveCloseDeadline: abortive close deadline calculated by Close. Zero if
-//     abortiveCloseTimeout is 0.
-func (this *TCPReactor) handleCommandClose(handler ClientHandler, abortiveCloseDeadline time.Time) {
+// Parameters:
+//   - handler is command.handler.
+//   - abortiveCloseDeadline is command.expiresAt, computed by [HandlerContext.Close] from
+//     abortiveCloseTimeout. Zero when abortiveCloseTimeout is 0.
+//
+// Notes:
+//   - Returns when handler.context().close is not [closeStateClose], that is, when AbortiveClose was
+//     requested after Close.
+//   - When [HandlerContext.isDrainedForClose] is true, commands.EnqueueUnregisterHandler(handler,
+//     [ErrTCPReactorCloseRequested], false) is called at once. The loop later runs
+//     [tcpReactor.handleCommandUnregisterHandler], which calls [tcpReactor.removeHandler]: the socket is
+//     closed and [ClientHandler.OnClose] receives [ErrTCPReactorCloseRequested].
+//   - When that EnqueueUnregisterHandler returns an error, handler.OnError receives it and removeHandler is
+//     called directly. Direct removal is safe here because this runs while the commandClose is being
+//     processed, so every command queued before it has already been handled.
+//   - Otherwise handler.context().setAbortiveCloseDeadline(abortiveCloseDeadline) stores the deadline and
+//     its result is passed to [tcpReactor.updateClientTimer]. The remaining writeBuffer is sent by
+//     [tcpReactor.handleEventWritable] or [tcpReactor.writeImmediately], which queue the removal when it is empty.
+func (this *tcpReactor) handleCommandClose(handler ClientHandler, abortiveCloseDeadline time.Time) {
 	if handler.context().close.Load() != closeStateClose {
 		return
 	}
@@ -205,13 +243,20 @@ func (this *TCPReactor) handleCommandClose(handler ClientHandler, abortiveCloseD
 	this.updateClientTimer(handler, nextExpiration, hasTimer)
 }
 
-// handleCommandAbortiveClose processes the AbortiveClose request and enqueues the unregister
-// command to close the connection with RST.
-// If enqueuing the close event fails, it calls OnError and removes the Handler immediately.
+// handleCommandAbortiveClose handles the commandAbortiveClose queued by [HandlerContext.AbortiveClose].
 //
-//   - handler: target of the close, and the command is ignored if it differs from the currently
-//     registered object.
-func (this *TCPReactor) handleCommandAbortiveClose(handler ClientHandler) {
+// Parameters:
+//   - handler is command.handler.
+//
+// Notes:
+//   - Returns when handler.context().close is not [closeStateAbort].
+//   - Calls commands.EnqueueUnregisterHandler(handler, [ErrTCPReactorAbortiveClose], true). The loop later
+//     runs [tcpReactor.handleCommandUnregisterHandler], which calls [tcpReactor.removeHandler] with soLinger
+//     true: the socket is closed with RST and [ClientHandler.OnClose] receives [ErrTCPReactorAbortiveClose].
+//   - When EnqueueUnregisterHandler returns an error, handler.OnError receives it and removeHandler is called
+//     directly. Direct removal is safe here because this runs while the commandAbortiveClose is being
+//     processed, so every command queued before it has already been handled.
+func (this *tcpReactor) handleCommandAbortiveClose(handler ClientHandler) {
 	if handler.context().close.Load() != closeStateAbort {
 		return
 	}
@@ -222,38 +267,37 @@ func (this *TCPReactor) handleCommandAbortiveClose(handler ClientHandler) {
 	}
 }
 
-// handleCommandUser calls the handler's OnUserEvent with the data delivered through PostUserEvent.
-// The event is delivered even if Close was requested after it was enqueued.
-// If the Handler is removed before it is processed, handleCommands discards the event and
-// OnUserEvent is not called.
+// handleCommandUser calls handler.context().onUserEvent(userEventData), which calls [ClientHandler.OnUserEvent].
 //
-//   - handler: ClientHandler currently registered in the Reactor.
-//   - userEventData: user event data enqueued through PostUserEvent.
-func (this *TCPReactor) handleCommandUser(handler ClientHandler, userEventData any) {
+// Parameters:
+//   - handler is command.handler.
+//   - userEventData is command.userEventData, the value given to [HandlerContext.PostUserEvent].
+func (this *tcpReactor) handleCommandUser(handler ClientHandler, userEventData any) {
 	handler.context().onUserEvent(userEventData)
 }
 
-// handleCommandWake calls the handler's OnWake for the Wake request.
-// HandlerContext.onWake clears wake immediately before OnWake, allowing a new request during the
-// callback. A queued Wake is delivered even after Close or AbortiveClose is requested.
-// If the Handler is removed before it is processed, handleCommands discards the command and
-// OnWake is not called.
+// handleCommandWake calls handler.context().onWake(), which clears the wake flag and calls [ClientHandler.OnWake].
 //
-//   - handler: ClientHandler currently registered in the Reactor.
-func (this *TCPReactor) handleCommandWake(handler ClientHandler) {
+// Parameters:
+//   - handler is command.handler of the commandWake queued by [HandlerContext.Wake].
+func (this *tcpReactor) handleCommandWake(handler ClientHandler) {
 	handler.context().onWake()
 }
 
-// updateClientTimer updates the timer expiration information of the ClientHandler.
-// If hasTimer is false, it removes the Handler from ClientTimer.
+// updateClientTimer calls clientTimer.Register(expiresAt, handler), or clientTimer.Unregister(handler) when
+// hasTimer is false.
 //
-//   - handler: Handler whose expiration information is updated.
-//   - expiresAt: nearest expiration time among the timers remaining for the Handler.
-//   - hasTimer: true if a timer remains, and if false, the Handler is removed from ClientTimer.
-func (this *TCPReactor) updateClientTimer(handler ClientHandler, expiresAt time.Time, hasTimer bool) {
+// Parameters:
+//   - handler is the handler whose [HandlerContext.nextExpiration] changed.
+//   - expiresAt is the nextExpiration value. Ignored when hasTimer is false.
+//   - hasTimer is the hasTimer value of nextExpiration. false means no timer and no abortiveCloseDeadline
+//     is set, so the handler's entry is removed from clientTimer.
+//
+// Notes:
+//   - The clientTimer.Register error is passed to handler.OnError.
+func (this *tcpReactor) updateClientTimer(handler ClientHandler, expiresAt time.Time, hasTimer bool) {
 	if !hasTimer {
-		// A handler that has already been drained or unregistered has no further registration to
-		// unregister.
+
 		this.clientTimer.Unregister(handler)
 		return
 	}

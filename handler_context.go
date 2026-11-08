@@ -14,101 +14,99 @@ import (
 	"github.com/netiogreem/erio/internal"
 )
 
-// HandlerContextError represents an error returned by HandlerContext.
+// HandlerContextError is the error type returned by [HandlerContext] methods.
+// It is a string so that each error can be declared as a comparable constant.
 type HandlerContextError string
 
-// Error returns the error string.
+// Error returns the error message.
 //
-// It returns the HandlerContext error message.
+// Returns:
+//   - The message text of the error constant.
 func (this HandlerContextError) Error() string {
 	return string(this)
 }
 
-// Errors returned by HandlerContext.
 const (
-	ErrHandlerContextUninitialized               HandlerContextError = "erio: handler context is not bound"
-	ErrHandlerContextClosed                      HandlerContextError = "erio: handler context connection is closed"
-	ErrHandlerContextAlreadyClosed               HandlerContextError = "erio: handler context connection is already closed"
-	ErrHandlerContextNilHandler                  HandlerContextError = "erio: handler context handler is nil"
-	ErrHandlerContextNilCommandMailbox           HandlerContextError = "erio: handler context command mailbox is nil"
-	ErrHandlerContextNilUserCommand              HandlerContextError = "erio: handler context user command is nil"
-	ErrHandlerContextAlreadyBound                HandlerContextError = "erio: handler context is already bound"
-	ErrHandlerContextInvalidFileDescriptor       HandlerContextError = "erio: invalid handler context file descriptor"
-	ErrHandlerContextInvalidPeerAddrPort         HandlerContextError = "erio: invalid handler context peer address"
-	ErrHandlerContextInvalidListenAddrPort       HandlerContextError = "erio: invalid handler context listen address"
-	ErrHandlerContextInvalidCommandQuota         HandlerContextError = "erio: invalid handler context command quota"
-	ErrHandlerContextInvalidAbortiveCloseTimeout HandlerContextError = "erio: invalid handler context abortive close timeout"
+	ErrHandlerContextUninitialized               HandlerContextError = "erio: handler context is not bound"                   // Returned when the context is a zero value or is not yet registered with a reactor.
+	ErrHandlerContextClosed                      HandlerContextError = "erio: handler context connection is closed"           // Returned by [HandlerContext.Write], [HandlerContext.PostUserEvent], [HandlerContext.Wake], [HandlerContext.SetTimeout], and [HandlerContext.UnsetTimeout] after [HandlerContext.Close] or [HandlerContext.AbortiveClose], or before registration.
+	ErrHandlerContextAlreadyClosed               HandlerContextError = "erio: handler context connection is already closed"   // Returned by [HandlerContext.Close] when a close was already requested, and by [HandlerContext.AbortiveClose] when an abortive close was already requested.
+	ErrHandlerContextNilHandler                  HandlerContextError = "erio: handler context handler is nil"                 // Returned during registration when the handler is nil.
+	ErrHandlerContextNilCommandMailbox           HandlerContextError = "erio: handler context command mailbox is nil"         // Returned during registration when the reactor's command queue is nil.
+	ErrHandlerContextNilUserCommand              HandlerContextError = "erio: handler context user command is nil"            // Returned by [HandlerContext.PostUserEvent] when userEventData is nil or a nil pointer.
+	ErrHandlerContextAlreadyBound                HandlerContextError = "erio: handler context is already bound"               // Returned by [TCPReactor.RegisterHandler] when the context is already registered with a reactor.
+	ErrHandlerContextInvalidFileDescriptor       HandlerContextError = "erio: invalid handler context file descriptor"        // Returned by [NewHandlerContext] and [HandlerContext.Init] when handlerFD is negative.
+	ErrHandlerContextInvalidPeerAddrPort         HandlerContextError = "erio: invalid handler context peer address"           // Returned by [NewHandlerContext] and [HandlerContext.Init], wrapped with the getpeername error when there is one, when the peer address cannot be read or is not IPv4 or IPv6.
+	ErrHandlerContextInvalidListenAddrPort       HandlerContextError = "erio: invalid handler context listen address"         // Returned by [NewHandlerContext] and [HandlerContext.Init] when listenAddrPort is not valid.
+	ErrHandlerContextInvalidCommandQuota         HandlerContextError = "erio: invalid handler context command quota"          // Returned by [NewHandlerContext] when commandQuota is 0.
+	ErrHandlerContextInvalidAbortiveCloseTimeout HandlerContextError = "erio: invalid handler context abortive close timeout" // Returned by [NewHandlerContext] when abortiveCloseTimeout is negative.
 )
 
-// closeStateType represents the close state of a client connection.
+// closeStateType is the value stored in [HandlerContext.close].
 type closeStateType = uint32
 
-// Close states of a client connection.
 const (
-	closeStateFalse closeStateType = iota // Usable
-	closeStateClose                       // Not registered, Close requested, or closed
-	closeStateAbort                       // AbortiveClose requested by the user
+	closeStateFalse closeStateType = iota // Connection is open.
+	closeStateClose                       // Graceful close was requested, or the context is not yet registered.
+	closeStateAbort                       // Abortive close was requested.
 )
 
-// HandlerContext provides send/receive, close, timer, user event, and wake features for a client TCP connection.
-// It must be created with NewHandlerContext.
-// Write, Close, AbortiveClose, SetTimeout, UnsetTimeout, PostUserEvent, and Wake can be called concurrently from
-// multiple goroutines. Before it is registered with TCPReactor, Write, SetTimeout, UnsetTimeout,
-// PostUserEvent, and Wake return ErrHandlerContextClosed, and Close and AbortiveClose return
-// ErrHandlerContextUninitialized.
+// HandlerContext is the connection object a [ClientHandler] uses to send data, post events, set
+// timers, and close the connection. One HandlerContext belongs to one connection and holds its
+// socket, write buffer, timers, close state, and addresses. Embed it in a handler struct; it provides
+// [ClientHandler.GetCommandQuota], the context accessor, and default implementations of
+// [ClientHandler.OnUserEvent], [ClientHandler.OnWake], [ClientHandler.OnTimeout], and
+// [ClientHandler.OnReadClose].
+//
+// Notes:
+//   - All methods except [HandlerContext.Init] and [HandlerContext.Reset] are thread-safe and can be
+//     called from other goroutines.
+//   - Write, SetTimeout, UnsetTimeout, Close, AbortiveClose, PostUserEvent, and Wake submit
+//     asynchronous requests to the reactor, which processes them on the session's goroutine;
+//     the returned error only covers submitting the request.
+//   - Write, PostUserEvent, SetTimeout, and UnsetTimeout share the command quota given to
+//     [NewHandlerContext]; Wake, Close, and AbortiveClose do not use it.
+//   - To reuse a context for another connection, call Reset last inside [ClientHandler.OnClose]
+//     and Init with the new connection before returning the handler from [ClientHandlerFactory].
 type HandlerContext struct {
-	close                 atomic.Uint32            // Close state of the connection (closeStateFalse, closeStateClose, closeStateAbort)
-	abortiveCloseTimeout  time.Duration            // Time to wait for pending write data after Close. 0 waits until all data is sent.
-	abortiveCloseDeadline time.Time                // Abortive close deadline set when TCPReactor processes Close. Zero if not set.
-	handlerFD             internal.FileDescriptor  // File descriptor duplicated from the client connection
-	writeBuffer           *internal.BufferDirector // Write buffer
-	handler               ClientHandler            // Connection event handler
-	commands              *commandMailbox          // TCPReactor command management
-	commandQuota          uint32                   // Per-connection limit on the total of pending timer, write, and user event commands
-	wake                  atomic.Bool              // Combines Wake requests until onWake clears it before OnWake. Also cleared on enqueue failure, Init, and Reset.
-	timer                 *internal.TimerRegistry  // Timers registered for the connection
-	peerAddrPort          netip.AddrPort           // Client address and port
-	listenAddrPort        netip.AddrPort           // Address and port of the listener that accepted the connection
-	handlerCounter        *atomic.Uint32           // Atomic that stores the number of registered handlers
-	immediateWrite        bool                     // Whether this Handler is already queued in commandMailbox.immediateWrites during an immediate write section. Guarded by commandMailbox.accessMutex.
+	close                 atomic.Uint32            // Current closeStateType.
+	abortiveCloseTimeout  time.Duration            // How long Close waits for pending data before aborting; 0 waits without limit.
+	abortiveCloseDeadline time.Time                // Time at which a graceful close turns abortive; zero when none.
+	handlerFD             internal.FileDescriptor  // Connected socket; -1 after Reset.
+	writeBuffer           *internal.BufferDirector // Data queued by Write and not yet sent.
+	handler               ClientHandler            // Handler that embeds this context; nil until bind.
+	commands              *commandMailbox          // Command queue of the reactor the handler is registered with; nil until bind.
+	commandQuota          uint32                   // Maximum quota-limited commands per event loop iteration.
+	wake                  atomic.Bool              // true while a Wake request is queued and not yet delivered.
+	timer                 *internal.TimerRegistry  // Timers set by SetTimeout, keyed by timerKey; nil until bind.
+	peerAddrPort          netip.AddrPort           // Remote address read from the socket at Init.
+	listenAddrPort        netip.AddrPort           // Local listen address the connection was accepted on.
+	handlerCounter        *atomic.Uint32           // Reactor's handler counter, shared after bind.
+	immediateWrite        bool                     // Set by the mailbox while a write is recorded for the current iteration.
 }
 
-// NewHandlerContext creates a HandlerContext for a client TCP connection.
+// NewHandlerContext creates a [HandlerContext] for an accepted connection.
 //
-//   - It does not close handlerFD on creation failure, and the caller must clean up the connection.
-//   - write, close, timer, user event, and wake requests can be used after TCPReactor registration is
-//     complete.
-//   - The write buffer is a double buffer for minimizing locking and uses twice the specified size.
+// Parameters:
+//   - handlerFD is the connected socket and must be non-negative. The context owns it and closes it
+//     when the connection is closed.
+//   - listenAddrPort is the local address the connection was accepted on and must be valid.
+//   - writeBufferSize is the capacity of the write buffer that holds data queued by [HandlerContext.Write]
+//     and not yet sent. Must be accepted by [internal.NewBufferDirector].
+//   - commandQuota is the number of [HandlerContext.Write], [HandlerContext.PostUserEvent],
+//     [HandlerContext.SetTimeout], and [HandlerContext.UnsetTimeout] requests accepted per event loop
+//     iteration. Must be at least 1.
+//   - abortiveCloseTimeout 0 sends all pending data without a time limit and then closes; a positive
+//     value closes with RST when the data is not sent within it. Must not be negative.
 //
-// The arguments are as follows.
+// Returns:
+//   - The context ready to be registered, and nil.
+//   - [ErrHandlerContextInvalidCommandQuota] when commandQuota is 0.
+//   - [ErrHandlerContextInvalidAbortiveCloseTimeout] when abortiveCloseTimeout is negative.
+//   - The [internal.NewBufferDirector] error when writeBufferSize is not accepted.
+//   - The [HandlerContext.Init] errors for handlerFD and listenAddrPort.
 //
-//   - handlerFD: file descriptor of the client TCP connection. It must not be negative.
-//   - listenAddrPort: address and port of the listener that accepted the connection.
-//     It must be a valid address.
-//   - writeBufferSize: write buffer size (bytes). It is a double buffer for reducing locking, so it
-//     uses twice the specified size.
-//     If the total including data waiting to be sent exceeds this size, Write returns an error
-//     without waiting.
-//   - commandQuota: limit on the total of requests on this connection not yet processed by the
-//     Reactor for Write, SetTimeout, UnsetTimeout, and PostUserEvent.
-//     If the limit is exceeded, the request returns an error.
-//     Write calls made while the Reactor is processing epoll events or expired timers are not
-//     included, regardless of the calling goroutine.
-//     Wake, Close, and AbortiveClose requests are not included.
-//     0 is not allowed.
-//   - abortiveCloseTimeout: time to wait for the pending write data to be sent after Close is
-//     called. If it is not sent within this time, the connection is closed with RST.
-//     0 waits until all data is sent. A negative value is not allowed.
-//
-// It returns the created HandlerContext and nil on success,
-// and returns nil and an error if an argument is invalid or if preparing the connection or buffers
-// fails.
-// It returns ErrHandlerContextInvalidFileDescriptor if handlerFD is negative,
-// ErrHandlerContextInvalidListenAddrPort if listenAddrPort is not valid,
-// ErrHandlerContextInvalidCommandQuota if commandQuota is 0,
-// ErrHandlerContextInvalidAbortiveCloseTimeout if abortiveCloseTimeout is negative,
-// ErrHandlerContextInvalidPeerAddrPort if the peer address cannot be retrieved,
-// and internal.ErrBufferDirectorInvalidSize (wrapped) if writeBufferSize is 0 or too large.
+// Caution:
+//   - handlerFD must be a non-blocking socket; a blocking socket stalls every session on the reactor.
 func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
 	writeBufferSize uint32, commandQuota uint32, abortiveCloseTimeout time.Duration) (*HandlerContext, error) {
 
@@ -137,19 +135,26 @@ func NewHandlerContext(handlerFD FileDescriptor, listenAddrPort netip.AddrPort,
 	return context, nil
 }
 
-// Init reuses the write buffer, commandQuota, and abortiveCloseTimeout, and sets up the state right
-// after creation with the given connection information.
-// It does not allocate a new write buffer and keeps its capacity.
-// If validation fails, it does not change the current object.
-// It does not close handlerFD on failure.
-// It must not be called concurrently with other methods.
-// It is safe to call only before the handler is registered with the Reactor (before returning it
-// from ClientHandlerFactory), after OnClose returns, or as the last call in OnClose.
+// Init prepares the context for a new connection, keeping the write buffer, command quota, and
+// abortive close timeout from [NewHandlerContext].
 //
-// It returns ErrHandlerContextUninitialized if it was not created with NewHandlerContext,
-// ErrHandlerContextInvalidFileDescriptor if handlerFD is negative,
-// ErrHandlerContextInvalidListenAddrPort if listenAddrPort is not valid,
-// and ErrHandlerContextInvalidPeerAddrPort if the peer address cannot be retrieved.
+// Parameters:
+//   - handlerFD is the connected socket and must be non-negative.
+//   - listenAddrPort is the local address the connection was accepted on and must be valid.
+//
+// Returns:
+//   - nil when the context is ready to be registered.
+//   - [ErrHandlerContextUninitialized] when the context is a zero value.
+//   - [ErrHandlerContextInvalidFileDescriptor] when handlerFD is negative.
+//   - [ErrHandlerContextInvalidListenAddrPort] when listenAddrPort is not valid.
+//   - [ErrHandlerContextInvalidPeerAddrPort], wrapped with the getpeername error, when the peer
+//     address cannot be read from handlerFD.
+//   - The write buffer reset error.
+//
+// Notes:
+//   - The context starts in the closed state; it becomes open when the reactor registers it.
+//   - Not thread-safe. Call it only before the handler is registered with the reactor, that is,
+//     before returning the handler from [ClientHandlerFactory].
 func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.AddrPort) error {
 	if this.writeBuffer == nil {
 		return ErrHandlerContextUninitialized
@@ -187,14 +192,17 @@ func (this *HandlerContext) Init(handlerFD FileDescriptor, listenAddrPort netip.
 	return nil
 }
 
-// Reset clears all state of HandlerContext except commandQuota and abortiveCloseTimeout.
-// The write buffer is emptied while keeping its capacity, and handlerFD is set to -1.
-// It does not close handlerFD, so it must be called after the FD is closed.
-// It must not be called concurrently with other methods.
-// It is safe to call only before the handler is registered with the Reactor (before returning it
-// from ClientHandlerFactory), after OnClose returns, or as the last call in OnClose.
+// Reset clears all state except the command quota and abortive close timeout, and sets the file
+// descriptor to -1. The write buffer keeps its capacity.
 //
-// It returns ErrHandlerContextUninitialized if it was not created with NewHandlerContext.
+// Returns:
+//   - nil when cleared.
+//   - [ErrHandlerContextUninitialized] when the context is a zero value.
+//   - The write buffer reset error.
+//
+// Notes:
+//   - Not thread-safe. If needed, call it last inside [ClientHandler.OnClose].
+//   - Call [HandlerContext.Init] to use the context for another connection.
 func (this *HandlerContext) Reset() error {
 	if this.writeBuffer == nil {
 		return ErrHandlerContextUninitialized
@@ -209,7 +217,7 @@ func (this *HandlerContext) Reset() error {
 	this.handlerFD = -1
 	this.handler = nil
 	this.commands = nil
-	// this.commandQuota = 0
+
 	this.wake.Store(false)
 	this.timer = nil
 	this.peerAddrPort = netip.AddrPort{}
@@ -220,12 +228,18 @@ func (this *HandlerContext) Reset() error {
 	return nil
 }
 
-// peerAddrPort retrieves the address and port of the remote peer of the connection.
+// peerAddrPort calls syscall.Getpeername(fd) and converts the result to [netip.AddrPort].
 //
-//   - fd: file descriptor of the connection.
+// Parameters:
+//   - fd is the connected socket.
 //
-// It returns the peer address and port, or an error if getpeername fails or the address is not
-// IPv4 or IPv6.
+// Returns:
+//   - The address and nil when Getpeername returned [syscall.SockaddrInet4] or [syscall.SockaddrInet6].
+//   - A zero AddrPort and the Getpeername error wrapped by os.NewSyscallError("getpeername", err).
+//   - A zero AddrPort and [ErrHandlerContextInvalidPeerAddrPort] when the sockaddr is another type.
+//
+// Notes:
+//   - For SockaddrInet6 the address goes through netip.Addr.Unmap, so an IPv4-mapped address becomes IPv4.
 func peerAddrPort(fd FileDescriptor) (netip.AddrPort, error) {
 	socketAddress, err := syscall.Getpeername(int(fd))
 	if err != nil {
@@ -242,29 +256,41 @@ func peerAddrPort(fd FileDescriptor) (netip.AddrPort, error) {
 	return netip.AddrPort{}, ErrHandlerContextInvalidPeerAddrPort
 }
 
-// GetCommandQuota returns the command quota assigned to the Handler.
+// GetCommandQuota returns the command quota of this session given to [NewHandlerContext].
 //
-// It returns the configured total.
+// Returns:
+//   - The commandQuota value. 0 for a zero-value context.
+//
+// Notes:
+//   - Implements [ClientHandler.GetCommandQuota].
 func (this *HandlerContext) GetCommandQuota() uint32 {
 	return this.commandQuota
 }
 
-// context returns the HandlerContext embedded in the Handler.
+// context returns the context itself so a handler embedding [HandlerContext] satisfies [ClientHandler].
 //
-// It returns the current HandlerContext pointer.
+// Returns:
+//   - The receiver.
 func (this *HandlerContext) context() *HandlerContext {
 	return this
 }
 
-// bind connects the handler so that it can use the connection features of TCPReactor.
+// bind sets this.handler, this.commands, this.timer (a new [internal.TimerRegistry]), and this.handlerCounter,
+// then stores [closeStateFalse] in close.
 //
-//   - handler: handler that receives connection events
-//   - commands: command queue of TCPReactor
-//   - handlerCounter: atomic that stores the number of registered handlers of TCPReactor. It must
-//     not be nil.
+// Parameters:
+//   - handler is the [ClientHandler] that embeds this context. Must not be nil.
+//   - commands is the [commandMailbox] of the reactor. Must not be nil.
+//   - handlerCounter is the reactor's handlerCounter, read by [HandlerContext.Count].
 //
-// It returns nil on success, and returns an error if handler or commands is nil or if it is
-// already connected.
+// Returns:
+//   - nil when the fields were set and close is closeStateFalse.
+//   - [ErrHandlerContextNilHandler] when handler is nil.
+//   - [ErrHandlerContextNilCommandMailbox] when commands is nil.
+//   - [ErrHandlerContextAlreadyBound] when this.handler is already set.
+//
+// Notes:
+//   - Called on the event loop goroutine by [tcpReactor.handleCommandRegisterHandler].
 func (this *HandlerContext) bind(handler ClientHandler, commands *commandMailbox, handlerCounter *atomic.Uint32) error {
 	if handler == nil {
 		return ErrHandlerContextNilHandler
@@ -286,18 +312,21 @@ func (this *HandlerContext) bind(handler ClientHandler, commands *commandMailbox
 	return nil
 }
 
-// isBound checks whether a handler is registered.
+// isBound returns this.handler != nil && this.commands != nil.
 //
-// It returns true if a handler is registered, and false otherwise.
+// Returns:
+//   - true after [HandlerContext.bind].
+//   - false before bind, and after [HandlerContext.Init] or [HandlerContext.Reset], which set both to nil.
 func (this *HandlerContext) isBound() bool {
 	return this.handler != nil && this.commands != nil
 }
 
-// Count returns the number of connected clients.
-// If multiple TCPReactors share the registration count, it returns the total of those Reactors.
+// Count returns the number of connected clients, counted across the reactors that share the
+// handler counter.
 //
-// It returns the number of currently registered handlers, which is 0 before TCPReactor
-// registration.
+// Returns:
+//   - The number of registered handlers.
+//   - 0 before registration.
 func (this *HandlerContext) Count() uint32 {
 	if this.handlerCounter == nil {
 		return 0
@@ -305,69 +334,90 @@ func (this *HandlerContext) Count() uint32 {
 	return this.handlerCounter.Load()
 }
 
-// PeerAddrPort returns the address and port of the client.
+// PeerAddrPort returns the remote address of the connection.
 //
-// It returns the client address and port.
+// Returns:
+//   - The remote address read from the socket at [HandlerContext.Init].
+//   - A zero value after [HandlerContext.Reset] or for a zero-value context.
 func (this *HandlerContext) PeerAddrPort() netip.AddrPort {
 	return this.peerAddrPort
 }
 
-// ListenAddrPort returns the address and port of the listener that accepted the connection.
+// ListenAddrPort returns the local address the connection was accepted on.
 //
-// It returns the listen address and port.
+// Returns:
+//   - The address given to [HandlerContext.Init].
+//   - A zero value after [HandlerContext.Reset] or for a zero-value context.
 func (this *HandlerContext) ListenAddrPort() netip.AddrPort {
 	return this.listenAddrPort
 }
 
-// OnUserEvent provides the default implementation of the user event callback.
-// The default implementation does nothing. To handle events, implement this method in the user
-// handler.
+// OnUserEvent is the default [ClientHandler.OnUserEvent] and does nothing.
 //
-//   - context: HandlerContext of the connection
-//   - userEventData: event data enqueued by the user
+// Parameters:
+//   - context is ignored.
+//   - userEventData is ignored.
+//
+// Notes:
+//   - Override it to receive events from [HandlerContext.PostUserEvent].
 func (this *HandlerContext) OnUserEvent(context *HandlerContext, userEventData any) {}
 
-// OnWake provides the default implementation of the wake callback.
-// The default implementation does nothing. To handle wakes, implement this method in the user
-// handler.
+// OnWake is the default [ClientHandler.OnWake] and does nothing.
 //
-//   - context: HandlerContext of the connection
+// Parameters:
+//   - context is ignored.
+//
+// Notes:
+//   - Override it to be called after [HandlerContext.Wake].
 func (this *HandlerContext) OnWake(context *HandlerContext) {}
 
-// OnTimeout is called when a timer expires.
-// It provides the default implementation of the timer expiration callback. The default
-// implementation does nothing.
+// OnTimeout is the default [ClientHandler.OnTimeout] and does nothing.
 //
-//   - context: HandlerContext of the connection
-//   - timerKey: key of the expired timer
+// Parameters:
+//   - context is ignored.
+//   - timerKey is ignored.
+//
+// Notes:
+//   - Override it to be called when a timer set by [HandlerContext.SetTimeout] expires.
 func (this *HandlerContext) OnTimeout(context *HandlerContext, timerKey uint64) {}
 
-// OnReadClose provides the default implementation of the read close callback.
-// The default implementation requests Close.
-// It is called only by TCPReactor for a registered connection; calling it before registration is
-// the caller's responsibility.
+// OnReadClose is the default [ClientHandler.OnReadClose]. It requests [HandlerContext.Close] so
+// pending data is sent and the connection is closed.
 //
-//   - context: HandlerContext of the connection
+// Parameters:
+//   - context is ignored; the receiver is used instead.
+//
+// Notes:
+//   - A Close error is passed to [ClientHandler.OnError].
+//   - The connection is still open when it is called. Override it to keep writing after the peer has
+//     closed its write side.
 func (this *HandlerContext) OnReadClose(context *HandlerContext) {
 	if err := this.Close(); err != nil {
 		this.handler.OnError(this, fmt.Errorf("HandlerContext.OnReadClose() Error: %w", err))
 	}
 }
 
-// Write requests data transmission.
-// Transmission is asynchronous. A nil return means success, and transmission completion is reported
-// through ClientHandler.OnWritten.
-// The same streamID is passed to ClientHandler.OnWritten.
-// Because it stores a copy internally, the original buffer can be reused after return. An empty
-// buffer is not sent.
+// Write sends buffer to the peer. The data is copied into the send buffer and written
+// asynchronously; completion is reported through [ClientHandler.OnWritten] with streamID.
 //
-//   - streamID: user-specified value that identifies the transmission
-//   - buffer: data to send
+// Parameters:
+//   - streamID identifies the message and is passed back to [ClientHandler.OnWritten] when the
+//     whole buffer has been sent.
+//   - buffer is copied into the write buffer; the caller may reuse it after Write returns.
+//     An empty buffer is ignored.
 //
-// It returns nil on success, and returns an error if not connected, if the write request fails, if
-// the command processing limit is exceeded, and so on.
-// It returns ErrHandlerContextClosed before registration or if the connection is closed,
-// and internal.ErrBufferDirectorFull if there is not enough space in the write buffer.
+// Returns:
+//   - nil when the data was accepted.
+//   - [ErrHandlerContextClosed] after [HandlerContext.Close] or [HandlerContext.AbortiveClose], or before registration.
+//   - [ErrHandlerContextUninitialized] when the context is a zero value or not registered.
+//   - The write buffer error when buffer does not fit.
+//   - [ErrCommandMailboxHandlerQuotaExceeded] when the command quota is used up until the reactor processes the pending requests.
+//   - [ErrCommandMailboxClosed] when the reactor is stopping.
+//   - A system call error when waking the reactor fails.
+//
+// Notes:
+//   - Data is sent on the session's reactor goroutine. [ClientHandler.OnWritten] means the data was handed
+//     to the kernel, not that the peer received it. [HandlerContext.UnwrittenSize] reports what is still pending.
 func (this *HandlerContext) Write(streamID int32, buffer []byte) error {
 	if this.close.Load() != closeStateFalse {
 		return ErrHandlerContextClosed
@@ -386,19 +436,19 @@ func (this *HandlerContext) Write(streamID int32, buffer []byte) error {
 	})
 }
 
-// PostUserEvent requests user event processing. It can be called from external goroutines.
-// For data passed with PostUserEvent, ClientHandler.OnUserEvent is called in the Reactor goroutine.
-// Data passed with PostUserEvent must not be modified by external goroutines until
-// ClientHandler.OnUserEvent processing finishes.
-// A nil return means a successful enqueue. If the Handler is removed before processing, the event is
-// not delivered. An event enqueued before Close is still delivered.
+// PostUserEvent delivers userEventData to [ClientHandler.OnUserEvent] on the session's goroutine.
 //
-//   - userEventData: user data to deliver
+// Parameters:
+//   - userEventData is passed to [ClientHandler.OnUserEvent] unchanged and must not be nil or a nil pointer.
 //
-// It returns nil on success, and returns an error if not connected, if the data is invalid, if the
-// command processing limit is exceeded, and so on.
-// It returns ErrHandlerContextClosed before registration or if the connection is closed,
-// and ErrHandlerContextNilUserCommand if userEventData is nil or a nil pointer.
+// Returns:
+//   - nil when queued.
+//   - [ErrHandlerContextClosed] after [HandlerContext.Close] or [HandlerContext.AbortiveClose], or before registration.
+//   - [ErrHandlerContextUninitialized] when the context is not registered.
+//   - [ErrHandlerContextNilUserCommand] when userEventData is nil or a nil pointer.
+//   - [ErrCommandMailboxHandlerQuotaExceeded] when the command quota is used up until the reactor processes the pending requests.
+//   - [ErrCommandMailboxClosed] when the reactor is stopping.
+//   - A system call error when waking the reactor fails.
 func (this *HandlerContext) PostUserEvent(userEventData any) error {
 	if this.close.Load() != closeStateFalse {
 		return ErrHandlerContextClosed
@@ -420,14 +470,21 @@ func (this *HandlerContext) PostUserEvent(userEventData any) error {
 	return this.commands.EnqueueUserEvent(this.handler, userEventData)
 }
 
-// Wake requests OnWake asynchronously in the Reactor goroutine without using the command quota.
-// Concurrent calls are combined until immediately before OnWake; calls during OnWake can request
-// another callback. A pending callback may run after a close request, but not after Handler removal.
+// Wake requests [ClientHandler.OnWake] on the session's goroutine without sending event data.
 //
-// It returns nil on success, and returns an error if not connected or if the request cannot be submitted.
-// A nil return does not guarantee callback execution if the Handler is removed before processing.
-// It returns ErrHandlerContextClosed before registration, after Close or AbortiveClose is requested,
-// or after the connection is closed.
+// Returns:
+//   - nil when requested, or when a Wake is already pending.
+//   - [ErrHandlerContextClosed] after [HandlerContext.Close] or [HandlerContext.AbortiveClose], or before registration.
+//   - [ErrHandlerContextUninitialized] when the context is not registered.
+//   - [ErrCommandMailboxClosed] when the reactor is stopping, or a system call error when waking the
+//     reactor fails. Wake can be called again.
+//
+// Notes:
+//   - Wake calls made before [ClientHandler.OnWake] starts are combined into one OnWake call. Calls made
+//     during OnWake request another one.
+//   - A nil return does not guarantee that OnWake runs. When the handler is removed before the
+//     request is processed, OnWake is skipped.
+//   - Does not use the command quota.
 func (this *HandlerContext) Wake() error {
 	if this.close.Load() != closeStateFalse {
 		return ErrHandlerContextClosed
@@ -449,17 +506,22 @@ func (this *HandlerContext) Wake() error {
 	return nil
 }
 
-// SetTimeout requests setting a timer.
-// If a timer with the same key exists, it is replaced with the new expiration time. Expiration is
-// reported through OnTimeout.
-// A timer setting is one-shot.
+// SetTimeout arms a timer that calls [ClientHandler.OnTimeout] with timerKey after timeout.
 //
-//   - timerKey: key that identifies the timer
-//   - timeout: time from when this method is called until expiration
+// Parameters:
+//   - timerKey identifies the timer. Setting an existing key again replaces its expiration.
+//   - timeout is measured from the time of this call.
 //
-// It returns nil on success, and returns an error if not connected, if the command processing limit
-// is exceeded, and so on.
-// It returns ErrHandlerContextClosed before registration or if the connection is closed.
+// Returns:
+//   - nil when queued.
+//   - [ErrHandlerContextClosed] after [HandlerContext.Close] or [HandlerContext.AbortiveClose], or before registration.
+//   - [ErrHandlerContextUninitialized] when the context is not registered.
+//   - [ErrCommandMailboxHandlerQuotaExceeded] when the command quota is used up until the reactor processes the pending requests.
+//   - [ErrCommandMailboxClosed] when the reactor is stopping.
+//   - A system call error when waking the reactor fails.
+//
+// Notes:
+//   - A timer fires once. Call SetTimeout again from [ClientHandler.OnTimeout] for a repeating timer.
 func (this *HandlerContext) SetTimeout(timerKey uint64, timeout time.Duration) error {
 	if this.close.Load() != closeStateFalse {
 		return ErrHandlerContextClosed
@@ -472,15 +534,21 @@ func (this *HandlerContext) SetTimeout(timerKey uint64, timeout time.Duration) e
 	return this.commands.EnqueueSetTimeout(this.handler, timerKey, time.Now().Add(timeout))
 }
 
-// UnsetTimeout requests unsetting a timer.
-// Unsetting is asynchronous. A nil return means the request succeeded and does not guarantee that
-// the timer has been unset immediately.
+// UnsetTimeout cancels the timer identified by timerKey.
 //
-//   - timerKey: key of the timer to unset
+// Parameters:
+//   - timerKey is the key given to [HandlerContext.SetTimeout]. An unknown key is ignored.
 //
-// It returns nil on success, and returns an error if not connected, if the timer unset request
-// fails, if the command processing limit is exceeded, and so on.
-// It returns ErrHandlerContextClosed before registration or if the connection is closed.
+// Returns:
+//   - nil when queued.
+//   - [ErrHandlerContextClosed] after [HandlerContext.Close] or [HandlerContext.AbortiveClose], or before registration.
+//   - [ErrHandlerContextUninitialized] when the context is not registered.
+//   - [ErrCommandMailboxHandlerQuotaExceeded] when the command quota is used up until the reactor processes the pending requests.
+//   - [ErrCommandMailboxClosed] when the reactor is stopping.
+//   - A system call error when waking the reactor fails.
+//
+// Notes:
+//   - A timer that expires before the cancel is processed on the event loop still fires.
 func (this *HandlerContext) UnsetTimeout(timerKey uint64) error {
 	if this.close.Load() != closeStateFalse {
 		return ErrHandlerContextClosed
@@ -493,16 +561,24 @@ func (this *HandlerContext) UnsetTimeout(timerKey uint64) error {
 	return this.commands.EnqueueUnsetTimeout(this.handler, timerKey)
 }
 
-// Close requests a normal close of the connection and returns without waiting.
-// The connection is closed after the data passed to Write is sent, and OnClose is called after the
-// connection is closed.
-// If the data is not sent within abortiveCloseTimeout, the connection is closed with RST.
-// If abortiveCloseTimeout is 0, it waits until all data is sent.
-// If received data remains unread, the peer receives RST instead of FIN.
-// It is not subject to the command quota.
+// Close requests a graceful close: pending data is sent, then the socket is closed and
+// [ClientHandler.OnClose] is called with [ErrTCPReactorCloseRequested].
 //
-// It returns ErrHandlerContextUninitialized if not registered, ErrHandlerContextClosed if already
-// closed, or an error if the request cannot be submitted.
+// Returns:
+//   - nil when queued.
+//   - [ErrHandlerContextUninitialized] when the context is not registered.
+//   - [ErrHandlerContextAlreadyClosed] when Close or [HandlerContext.AbortiveClose] was already called.
+//   - [ErrCommandMailboxClosed] when the reactor is stopping, or a system call error when waking the reactor fails.
+//
+// Notes:
+//   - [HandlerContext.Write], [HandlerContext.PostUserEvent], [HandlerContext.Wake], [HandlerContext.SetTimeout],
+//     and [HandlerContext.UnsetTimeout] fail with [ErrHandlerContextClosed] from this point.
+//   - With abortiveCloseTimeout 0, the connection is closed only after all pending data is sent,
+//     so it stays open as long as the peer does not read. Set abortiveCloseTimeout or call
+//     [HandlerContext.AbortiveClose] when the connection must be closed.
+//   - With a positive abortiveCloseTimeout, pending data not sent within it is discarded, the
+//     connection is closed with RST, and [ClientHandler.OnClose] receives [ErrTCPReactorAbortiveCloseTimeout].
+//   - Does not use the command quota.
 func (this *HandlerContext) Close() error {
 	if this.handler == nil || this.commands == nil {
 		return ErrHandlerContextUninitialized
@@ -520,14 +596,21 @@ func (this *HandlerContext) Close() error {
 	return this.commands.EnqueueClose(this.handler, deadline)
 }
 
-// AbortiveClose requests a forced close of the connection with RST and returns without waiting.
-// It can also be requested while Close is waiting for the pending write data to be sent.
-// OnClose is called after the connection is closed.
-// Data not yet delivered to the peer is discarded, including data already reported by OnWritten.
-// It is not subject to the command quota.
+// AbortiveClose requests an immediate close that discards pending data: the socket is closed
+// with SO_LINGER 0 so the peer receives RST, and [ClientHandler.OnClose] is called with
+// [ErrTCPReactorAbortiveClose].
 //
-// It returns ErrHandlerContextUninitialized if not registered, ErrHandlerContextAlreadyClosed if
-// AbortiveClose was already requested, or an error if the request cannot be submitted.
+// Returns:
+//   - nil when queued.
+//   - [ErrHandlerContextUninitialized] when the context is not registered.
+//   - [ErrHandlerContextAlreadyClosed] when AbortiveClose was already called.
+//   - [ErrCommandMailboxClosed] when the reactor is stopping, or a system call error when waking the reactor fails.
+//
+// Notes:
+//   - May be called while a [HandlerContext.Close] request is still waiting for pending data to be sent.
+//   - Data already reported through [ClientHandler.OnWritten] is discarded too when it has not
+//     reached the peer yet.
+//   - Does not use the command quota.
 func (this *HandlerContext) AbortiveClose() error {
 	if this.handler == nil || this.commands == nil {
 		return ErrHandlerContextUninitialized
@@ -541,58 +624,76 @@ func (this *HandlerContext) AbortiveClose() error {
 	return this.commands.EnqueueAbortiveClose(this.handler)
 }
 
-// IsClosed checks whether the connection is closed.
+// IsClosed reports whether the connection can no longer be used.
 //
-// It returns true if closed or a close is requested, and false if usable, and it is true even
-// before TCPReactor registration.
+// Returns:
+//   - true when a close was requested, the connection was lost, or the context was initialized but
+//     not yet registered.
+//   - false while the connection is registered and open.
+//
+// Notes:
+//   - A zero-value context that never went through [NewHandlerContext] or [HandlerContext.Init] reports false.
 func (this *HandlerContext) IsClosed() bool {
 	return this.close.Load() != closeStateFalse
 }
 
-// IsAbortiveClosed checks whether AbortiveClose was requested.
+// IsAbortiveClosed reports whether an abortive close was requested.
 //
-// It returns true if AbortiveClose was requested, and false otherwise.
+// Returns:
+//   - true after [HandlerContext.AbortiveClose] was accepted.
+//   - false otherwise, including after a graceful [HandlerContext.Close].
 func (this *HandlerContext) IsAbortiveClosed() bool {
 	return this.close.Load() == closeStateAbort
 }
 
-// IsOpen checks whether the connection is usable.
+// IsOpen reports whether the connection is registered and no close was requested.
 //
-// It returns true if registered with TCPReactor and neither Close nor AbortiveClose was requested,
-// and false otherwise.
+// Returns:
+//   - true while the connection is registered and open.
+//   - false when a close was requested, the connection was lost, or the context was initialized but
+//     not yet registered.
+//
+// Notes:
+//   - A zero-value context that never went through [NewHandlerContext] or [HandlerContext.Init] reports true.
 func (this *HandlerContext) IsOpen() bool {
 	return this.close.Load() == closeStateFalse
 }
 
-// UnwrittenSize returns the size of the data passed to Write that has not yet been written to the
-// socket.
+// UnwrittenSize returns the number of bytes passed to [HandlerContext.Write] that have not yet
+// been written to the socket.
 //
-// It returns the unwritten size in bytes.
+// Returns:
+//   - The number of pending bytes in the write buffer. 0 for a zero-value context
 func (this *HandlerContext) UnwrittenSize() uint64 {
 	return this.writeBuffer.RemainingSize()
 }
 
-// isDrainedForClose checks whether Close or AbortiveClose was requested and all data passed to Write
-// has been written to the socket.
+// isDrainedForClose returns close.Load() != closeStateFalse && writeBuffer.RemainingSize() == 0.
 //
-// It returns true if the connection can be closed without unwritten data, and false otherwise.
+// Returns:
+//   - true when Close or AbortiveClose was requested, or the connection was lost, and writeBuffer is empty.
+//   - false otherwise.
 func (this *HandlerContext) isDrainedForClose() bool {
 	return this.close.Load() != closeStateFalse && this.writeBuffer.RemainingSize() == 0
 }
 
-// onReadable reads into readBuffer and passes received data to OnRead.
-// readBuffer is shared by all connections of the Reactor, so to keep the data after OnRead,
-// the callback must copy it.
-// Receive processing errors are reported through OnError.
+// onReadable calls read(2) on handlerFD into readBuffer with syscall.RawSyscall(SYS_READ) and passes
+// readBuffer[:recvBytes] to handler.OnRead.
 //
-//   - readAll: if true, it reads all currently receivable data, and if false, it receives only
-//     once.
-//   - readBuffer: receive buffer of the Reactor. It must not be empty.
+// Parameters:
+//   - readAll true repeats the read until it returns EAGAIN, 0, or an error; false reads once.
+//   - readBuffer is the tcpReactor.readBuffer shared by all handlers of the reactor. Must not be empty.
 //
-// isEof is true if read returned 0 because the peer closed its sending side, and false otherwise.
+// Returns:
+//   - true when read returned 0, that is, the peer closed the connection.
+//   - false when read returned EAGAIN or EWOULDBLOCK, when another error occurred, or after one read when
+//     readAll is false.
 //
-// Reading, writing, and closing the connection are all done only in the Reactor goroutine, so it
-// uses handlerFD directly without rawConn.Control.
+// Notes:
+//   - EINTR is retried.
+//   - An error other than EAGAIN and EWOULDBLOCK is passed to handler.OnError as
+//     os.NewSyscallError("read", err) and ends the read.
+//   - The slice passed to OnRead is readBuffer[:recvBytes:recvBytes], valid only during the call.
 func (this *HandlerContext) onReadable(readAll bool, readBuffer []byte) (isEof bool) {
 	for {
 		var recvBytes int
@@ -632,14 +733,17 @@ func (this *HandlerContext) onReadable(readAll bool, readBuffer []byte) (isEof b
 	}
 }
 
-// onWritable sends the data waiting to be sent to the client.
-// Transmission completion is reported through OnWritten, and transmission processing errors through
-// OnError.
+// onWritable calls writeBuffer.ConsumeWith with a consumer that calls write(2) on handlerFD with
+// syscall.RawSyscall(SYS_WRITE), then calls handler.OnWritten for each message that was written completely.
 //
-// hasRemaining is true if data to send remains, and false otherwise.
+// Returns:
+//   - The hasRemaining value of ConsumeWith: true when writeBuffer still has data, false when it is empty.
 //
-// Reading, writing, and closing the connection are all done only in the Reactor goroutine, so it
-// uses handlerFD directly without rawConn.Control.
+// Notes:
+//   - EINTR is retried. EAGAIN and EWOULDBLOCK are turned into a nil error, so the consumer returns the bytes
+//     written so far.
+//   - handler.OnWritten(this, info.ID, info.Length) is called for every entry of consumedMesgs before the
+//     consumeError, if any, is passed to handler.OnError as os.NewSyscallError("write", err).
 func (this *HandlerContext) onWritable() (hasRemaining bool) {
 	consumer := func(data []byte, _ []internal.MessageInfo) (uint32, error) {
 		var writtenSize int
@@ -680,30 +784,35 @@ func (this *HandlerContext) onWritable() (hasRemaining bool) {
 	return hasRemaining
 }
 
-// onUserEvent passes user event data to OnUserEvent.
+// onUserEvent calls handler.OnUserEvent(this, userEventData).
 //
-//   - userEventData: user event data enqueued with PostUserEvent
+// Parameters:
+//   - userEventData is the value given to [HandlerContext.PostUserEvent].
 func (this *HandlerContext) onUserEvent(userEventData any) {
 	this.handler.OnUserEvent(this, userEventData)
 }
 
-// onWake clears the wake latch and then calls OnWake.
-// It runs in the Reactor goroutine without checking the close state.
-// Clearing wake first allows Wake to enqueue another command during OnWake if the connection is open.
+// onWake calls wake.Store(false) and then handler.OnWake(this).
+//
+// Notes:
+//   - wake is cleared first so that [HandlerContext.Wake] called inside OnWake passes its
+//     wake.CompareAndSwap(false, true) and queues a new commandWake.
 func (this *HandlerContext) onWake() {
 	this.wake.Store(false)
 	this.handler.OnWake(this)
 }
 
-// onTimeout reports timer expiration through OnTimeout, and then checks whether the abortive close
-// deadline has expired.
+// onTimeout calls handler.OnTimeout(this, timerKey) for every key returned by timer.PopExpired() and checks
+// abortiveCloseDeadline.
 //
-// nextExpiration is the nearest next expiration time including the abortive close deadline.
+// Returns:
+//   - nextExpiration and hasTimer are the values of [HandlerContext.nextExpiration] after the expired keys
+//     were removed.
+//   - aborted is true when abortiveCloseDeadline is not zero and is not after time.Now().
 //
-// hasTimer is true if there is a registered timer or abortive close deadline, and false otherwise.
-//
-// aborted is true if the abortive close deadline has expired, and then nextExpiration and hasTimer
-// are not used.
+// Notes:
+//   - PopExpired removes the keys before OnTimeout runs, so [HandlerContext.SetTimeout] inside OnTimeout
+//     with the same key re-arms it.
 func (this *HandlerContext) onTimeout() (nextExpiration time.Time, hasTimer bool, aborted bool) {
 	for _, timerKey := range this.timer.PopExpired() {
 		this.handler.OnTimeout(this, timerKey)
@@ -717,10 +826,14 @@ func (this *HandlerContext) onTimeout() (nextExpiration time.Time, hasTimer bool
 	return nextExpiration, hasTimer, aborted
 }
 
-// nextExpiration returns the nearest of the next user timer expiration and the abortive close
-// deadline.
+// nextExpiration merges timer.NextExpiration() with abortiveCloseDeadline into the single time that
+// [tcpReactor.updateClientTimer] registers in clientTimer.
 //
-// hasTimer is true if there is a registered timer or abortive close deadline, and false otherwise.
+// Returns:
+//   - timer.NextExpiration() when abortiveCloseDeadline is zero.
+//   - abortiveCloseDeadline and true when timer has no entry or abortiveCloseDeadline is before the timer's.
+//   - timer.NextExpiration() otherwise.
+//   - hasTimer is false only when timer is empty and abortiveCloseDeadline is zero.
 func (this *HandlerContext) nextExpiration() (nextExpiration time.Time, hasTimer bool) {
 	nextExpiration, hasTimer = this.timer.NextExpiration()
 	if this.abortiveCloseDeadline.IsZero() {
@@ -734,14 +847,17 @@ func (this *HandlerContext) nextExpiration() (nextExpiration time.Time, hasTimer
 	return nextExpiration, hasTimer
 }
 
-// setAbortiveCloseDeadline sets the abortive close deadline if abortiveCloseTimeout is greater than
-// 0, and returns the next expiration. It is called when TCPReactor processes Close and data remains.
+// setAbortiveCloseDeadline stores abortiveCloseDeadline when abortiveCloseTimeout > 0 and returns
+// [HandlerContext.nextExpiration].
 //
-//   - abortiveCloseDeadline: deadline calculated by Close.
+// Parameters:
+//   - abortiveCloseDeadline is command.expiresAt of the commandClose, computed by [HandlerContext.Close].
 //
-// nextExpiration is the nearest expiration time including the abortive close deadline.
+// Returns:
+//   - The values of nextExpiration after the store.
 //
-// hasTimer is true if there is a registered timer or abortive close deadline, and false otherwise.
+// Notes:
+//   - When abortiveCloseTimeout is 0 the field stays zero, so [HandlerContext.onTimeout] never returns aborted true.
 func (this *HandlerContext) setAbortiveCloseDeadline(abortiveCloseDeadline time.Time) (nextExpiration time.Time, hasTimer bool) {
 	if this.abortiveCloseTimeout > 0 {
 		this.abortiveCloseDeadline = abortiveCloseDeadline
@@ -750,33 +866,33 @@ func (this *HandlerContext) setAbortiveCloseDeadline(abortiveCloseDeadline time.
 	return this.nextExpiration()
 }
 
-//  * Client connection close errors
-// 	  errors.Is(err, net.ErrClosed) ||
-// 		errors.Is(err, syscall.ECONNRESET) ||
-// 		errors.Is(err, syscall.ECONNABORTED) ||
-// 		errors.Is(err, syscall.ETIMEDOUT) ||
-// 		errors.Is(err, syscall.ENOTCONN) ||
-// 		errors.Is(err, syscall.EPIPE) ||
-// 		errors.Is(err, syscall.ESHUTDOWN)
-
-// abortConnection closes the client connection with SO_LINGER 0.
-// It attempts to close the connection even if setting SO_LINGER fails.
+// abortConnection returns closeFileDescriptor(true): SO_LINGER 0 then close, so the peer receives RST and
+// data in the kernel send buffer is discarded.
 //
-// It returns nil on success, and returns an error if setting SO_LINGER or closing the connection
-// fails.
+// Returns:
+//   - The value of [HandlerContext.closeFileDescriptor].
 func (this *HandlerContext) abortConnection() error {
 	return this.closeFileDescriptor(true)
 }
 
-// closeConnection closes the client connection.
+// closeConnection returns closeFileDescriptor(false): a plain close, so the kernel still sends data in its
+// send buffer.
 //
-// It returns nil on success, and returns an error if closing the connection fails.
+// Returns:
+//   - The value of [HandlerContext.closeFileDescriptor].
 func (this *HandlerContext) closeConnection() error {
 	return this.closeFileDescriptor(false)
 }
 
-// closeFileDescriptor closes handlerFD in the Reactor goroutine.
-// If setLinger is true, it sets SO_LINGER 0 and then closes it.
+// closeFileDescriptor calls syscall.Close(handlerFD), after syscall.SetsockoptLinger with Onoff 1 and Linger 0
+// when setLinger is true.
+//
+// Parameters:
+//   - setLinger true sets SO_LINGER to 0 first, so the close sends RST and discards pending data.
+//
+// Returns:
+//   - nil when SetsockoptLinger (if called) and Close succeeded.
+//   - errors.Join of the "setsockopt" and "close" [os.SyscallError] values otherwise.
 func (this *HandlerContext) closeFileDescriptor(setLinger bool) error {
 	var lingerError error
 	if setLinger {
@@ -787,15 +903,17 @@ func (this *HandlerContext) closeFileDescriptor(setLinger bool) error {
 	return errors.Join(lingerError, os.NewSyscallError("close", syscall.Close(int(this.handlerFD))))
 }
 
-// onSetTimeout sets the timer for the given key.
-// Registration errors are passed to OnError.
+// onSetTimeout calls timer.Register(expiresAt, timerKey) and returns [HandlerContext.nextExpiration].
 //
-//   - timerKey: key that identifies the timer
-//   - expiresAt: timer expiration time
+// Parameters:
+//   - timerKey is the key given to [HandlerContext.SetTimeout]. An existing key is moved to expiresAt.
+//   - expiresAt is the time computed by SetTimeout.
 //
-// nextExpiration is the nearest expiration time including the abortive close deadline.
+// Returns:
+//   - The values of nextExpiration after Register.
 //
-// hasTimer is true if there is a registered timer or abortive close deadline, and false otherwise.
+// Notes:
+//   - The Register error is passed to handler.OnError and timer is left unchanged.
 func (this *HandlerContext) onSetTimeout(timerKey uint64, expiresAt time.Time) (nextExpiration time.Time, hasTimer bool) {
 	if err := this.timer.Register(expiresAt, timerKey); err != nil {
 		this.handler.OnError(this, err)
@@ -805,13 +923,14 @@ func (this *HandlerContext) onSetTimeout(timerKey uint64, expiresAt time.Time) (
 	return this.nextExpiration()
 }
 
-// onUnsetTimeout unsets the timer for the given key.
+// onUnsetTimeout calls timer.Unregister(timerKey) and returns [HandlerContext.nextExpiration].
 //
-//   - timerKey: key of the timer to unset
+// Parameters:
+//   - timerKey is the key given to [HandlerContext.UnsetTimeout]. Unregister returns false for an unknown
+//     key, which is ignored.
 //
-// nextExpiration is the nearest expiration time including the abortive close deadline.
-//
-// hasTimer is true if there is a registered timer or abortive close deadline, and false otherwise.
+// Returns:
+//   - The values of nextExpiration after Unregister.
 func (this *HandlerContext) onUnsetTimeout(timerKey uint64) (nextExpiration time.Time, hasTimer bool) {
 	if !this.timer.Unregister(timerKey) {
 		return this.nextExpiration()
@@ -820,17 +939,22 @@ func (this *HandlerContext) onUnsetTimeout(timerKey uint64) (nextExpiration time
 	return this.nextExpiration()
 }
 
-// fileDescriptor returns the file descriptor of the client connection.
-// The return value cannot be used to determine whether the connection is closed.
+// fileDescriptor returns handlerFD.
 //
-// It is the file descriptor set by NewHandlerContext or Init, or -1 after Reset, and it returns
-// the same value even after the connection is closed.
+// Returns:
+//   - The handlerFD given to [HandlerContext.Init].
+//   - -1 after [HandlerContext.Reset]. 0 for a zero-value context.
 func (this *HandlerContext) fileDescriptor() internal.FileDescriptor {
 	return this.handlerFD
 }
 
-// setClosed records only the closed state of the client connection without closing the socket.
-// It does not change the state requested by AbortiveClose.
+// setClosed calls close.CompareAndSwap(closeStateFalse, closeStateClose).
+//
+// Notes:
+//   - When close is already closeStateClose or closeStateAbort, nothing changes.
+//   - Called by [tcpReactor.handleEvent] on EPOLLHUP, [tcpReactor.removeHandler], and
+//     [tcpReactor.rejectHandler], so later Write, PostUserEvent, Wake, SetTimeout, and UnsetTimeout return
+//     [ErrHandlerContextClosed].
 func (this *HandlerContext) setClosed() {
 	this.close.CompareAndSwap(closeStateFalse, closeStateClose)
 }

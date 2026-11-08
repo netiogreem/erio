@@ -324,7 +324,7 @@ func (this *MyHandler) OnWake(context *erio.HandlerContext) {
   * ReactorParam
     * Count: The number of Reactors.
     * EventBatchSize: The maximum number of events received per epoll wait.
-    * RegisterCommandQuota: The maximum number of RegisterHandler commands each Reactor can accept at a time.
+    * RegisterCommandQuota: The number of RegisterHandler requests accepted per event loop iteration. Beyond it, RegisterHandler returns ErrCommandMailboxRegisterQuotaExceeded and the Acceptor rejects the connection.
     * CommandReserveSize: The reserved size of the command queue.
     * ReadBufferSize: The receive buffer size of each Reactor.
     * ErrorCallback: Reactor error callback
@@ -374,7 +374,7 @@ func (this *Builder) Build() (server *TCPServer, err error)
 
 * Created by Builder.Build(), it manages accepting connections and starting and stopping the Reactors.
 * Start() starts all Reactors and then starts listening.
-* Stop() stops accepting new connections, stops all Reactors, waits for them to finish, and releases their epoll and eventfd resources. It returns nil regardless of the stop results.
+* Stop() stops accepting new connections, stops all Reactors, waits for them to finish, and releases their epoll and eventfd resources. It returns ErrTCPServerStateNotRunning when the server is not running; otherwise it returns nil regardless of the stop results.
 * If you specified port 0, you can query the port actually assigned after Start() succeeds.
 
 ```go
@@ -400,7 +400,7 @@ erio avoids approaches that rely solely on callbacks, such as the On{Event}(onCo
 * Users must implement the ClientHandler interface. A ClientHandler is created for each connection.
 * ClientHandler must not be used from other goroutines.
   * When you need to send commands from another goroutine, you can safely use the HandlerContext owned by the ClientHandler.
-* ClientHandler is called only from the TCPReactor's goroutine.
+* ClientHandler callbacks are called only from the TCPReactor's goroutine.
 
 ```Go
 package erio
@@ -572,6 +572,15 @@ func (this *HandlerContext) Close() error
 // Can be requested even while a Close() request is already waiting for the remaining data to be sent.
 // Even data reported as complete via OnWritten is discarded if it has not been delivered to the peer.
 func (this *HandlerContext) AbortiveClose() error
+
+// Default implementation of ClientHandler.OnUserEvent. It does nothing.
+func (this *HandlerContext) OnUserEvent(context *HandlerContext, userEventData any)
+
+// Default implementation of ClientHandler.OnWake. It does nothing.
+func (this *HandlerContext) OnWake(context *HandlerContext)
+
+// Default implementation of ClientHandler.OnTimeout. It does nothing.
+func (this *HandlerContext) OnTimeout(context *HandlerContext, timerKey uint64)
 
 // Default implementation of ClientHandler.OnReadClose. It requests Close.
 func (this *HandlerContext) OnReadClose(context *HandlerContext)

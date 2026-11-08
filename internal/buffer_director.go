@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 func NewBufferDirector(bufferSize uint32) (*BufferDirector, error) {
@@ -19,6 +20,7 @@ func NewBufferDirector(bufferSize uint32) (*BufferDirector, error) {
 		prepareBuffer:  make([]byte, 0, int(bufferSize)),
 		prepareMesgs:   make([]MessageInfo, 0, 16),
 		prepareMutex:   sync.Mutex{},
+		remainingSize:  atomic.Uint64{},
 	}, nil
 }
 
@@ -52,6 +54,10 @@ type BufferDirector struct {
 	prepareBuffer []byte
 	prepareMesgs  []MessageInfo
 	prepareMutex  sync.Mutex
+
+	// remainingSize is the number of bytes appended but not yet consumed in both buffers.
+	// RemainingSize reads it without prepareMutex while the consumer runs.
+	remainingSize atomic.Uint64
 }
 
 func (this *BufferDirector) Append(messageID int32, data []byte) error {
@@ -77,6 +83,7 @@ func (this *BufferDirector) Append(messageID int32, data []byte) error {
 		Length: dataSize,
 		remain: dataSize,
 	})
+	this.remainingSize.Add(uint64(dataSize))
 
 	return nil
 }
@@ -112,6 +119,7 @@ func (this *BufferDirector) AppendWith(messageID int32, data []byte, lockedOnApp
 		Length: dataSize,
 		remain: dataSize,
 	})
+	this.remainingSize.Add(uint64(dataSize))
 
 	return nil
 }
@@ -119,6 +127,7 @@ func (this *BufferDirector) AppendWith(messageID int32, data []byte, lockedOnApp
 func (this *BufferDirector) ClearAppendBuffer() {
 	this.prepareMutex.Lock()
 	defer this.prepareMutex.Unlock()
+	this.remainingSize.Add(-uint64(len(this.prepareBuffer)))
 	this.prepareBuffer = this.prepareBuffer[:0]
 	this.prepareMesgs = this.prepareMesgs[:0]
 }
@@ -137,14 +146,16 @@ func (this *BufferDirector) Reset() error {
 	this.consumeMesgIdx = 0
 	this.prepareBuffer = this.prepareBuffer[:0]
 	this.prepareMesgs = this.prepareMesgs[:0]
+	this.remainingSize.Store(0)
 
 	return nil
 }
 
 func (this *BufferDirector) RemainingSize() uint64 {
-	this.prepareMutex.Lock()
-	defer this.prepareMutex.Unlock()
-	return uint64(len(this.consumeBuffer)) - uint64(this.consumeSize) + uint64(len(this.prepareBuffer))
+	if this == nil {
+		return 0
+	}
+	return this.remainingSize.Load()
 }
 
 func (this *BufferDirector) ConsumeWith(consumer func(datas []byte, mesgs []MessageInfo) (consumedBytes uint32, err error),
@@ -173,6 +184,7 @@ func (this *BufferDirector) ConsumeWith(consumer func(datas []byte, mesgs []Mess
 		consumedBytes = uint32(len(datas))
 	}
 
+	this.remainingSize.Add(-uint64(consumedBytes))
 	return consumedBytes, this.updateActiveMesgs(consumedBytes), this.swapPrepared(), consumerError
 }
 
@@ -211,6 +223,7 @@ func (this *BufferDirector) Consume() (datas []byte, mesgs []MessageInfo, hasRem
 
 	datas = this.consumeBuffer[this.consumeSize:len(this.consumeBuffer):len(this.consumeBuffer)]
 	this.consumeSize += uint32(len(datas))
+	this.remainingSize.Add(-uint64(len(datas)))
 
 	mesgs = this.consumeMesgs[this.consumeMesgIdx:len(this.consumeMesgs):len(this.consumeMesgs)]
 	this.consumeMesgIdx += uint32(len(mesgs))

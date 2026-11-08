@@ -11,89 +11,105 @@ import (
 	"github.com/netiogreem/erio/internal"
 )
 
-// commandType represents the type of a command delivered by commandMailbox.
+// commandType identifies the kind of [command] queued in a [commandMailbox].
 type commandType uint8
 
 const (
-	commandStop commandType = iota
-	commandSetTimeout
-	commandUnsetTimeout
-	commandWrite
-	commandRegisterHandler
-	commandUnregisterHandler
-	commandUser
-	commandWake          // Wake command that calls OnWake
-	commandClose         // Normal connection close command
-	commandAbortiveClose // Forced (RST) connection close command
+	commandStop              commandType = iota // Stops the event loop. Always drained last.
+	commandSetTimeout                           // Sets the timer identified by timerKey to fire at expiresAt.
+	commandUnsetTimeout                         // Cancels the timer identified by timerKey.
+	commandWrite                                // Requests a write for the handler's pending data.
+	commandRegisterHandler                      // Adds a handler to the event loop.
+	commandUnregisterHandler                    // Removes a handler from the event loop with reason and soLinger.
+	commandUser                                 // Delivers userEventData to the handler.
+	commandWake                                 // Wakes the handler without data.
+	commandClose                                // Closes the handler gracefully; falls back to an abortive close at expiresAt.
+	commandAbortiveClose                        // Closes the handler immediately, discarding pending data.
 )
 
-// commandMailboxError represents an error returned by commandMailbox.
+// commandMailboxError is the error type returned by [commandMailbox] methods.
+// It is a string so that each error can be declared as a comparable constant.
 type commandMailboxError string
 
-// Error returns the error string.
+// Error returns the error message.
 //
-// It is the commandMailbox error message.
+// Returns:
+//   - The message text of the error constant.
 func (this commandMailboxError) Error() string {
 	return string(this)
 }
 
-// Errors returned by commandMailbox.
 const (
-	ErrCommandMailboxUninitialized               commandMailboxError = "erio: command mailbox is uninitialized"
-	ErrCommandMailboxInvalidFileDescriptor       commandMailboxError = "erio: invalid command mailbox file descriptor"
-	ErrCommandMailboxClosed                      commandMailboxError = "erio: command mailbox is closed"
-	ErrCommandMailboxInvalidReserveSize          commandMailboxError = "erio: invalid command mailbox reserve size"
-	ErrCommandMailboxInvalidRegisterCommandQuota commandMailboxError = "erio: invalid register command quota"
-	ErrCommandMailboxRegisterQuotaExceeded       commandMailboxError = "erio: register command quota exceeded"
-	ErrCommandMailboxHandlerQuotaExceeded        commandMailboxError = "erio: handler command quota exceeded"
-	ErrCommandMailboxNilHandler                  commandMailboxError = "erio: handler is nil"
-	ErrCommandMailboxNotRegistered               commandMailboxError = "erio: handler is not registered in command mailbox"
-	ErrCommandMailboxInvalidCommand              commandMailboxError = "erio: invalid command"
+	ErrCommandMailboxUninitialized               commandMailboxError = "erio: command mailbox is uninitialized"             // Returned when the mailbox was not created with [newCommandMailbox].
+	ErrCommandMailboxInvalidFileDescriptor       commandMailboxError = "erio: invalid command mailbox file descriptor"      // Returned by [newCommandMailbox] when commandFD is negative.
+	ErrCommandMailboxClosed                      commandMailboxError = "erio: command mailbox is closed"                    // Returned when a command is enqueued before [commandMailbox.Open] or after [commandMailbox.Stop] or [commandMailbox.EnqueueStop].
+	ErrCommandMailboxInvalidReserveSize          commandMailboxError = "erio: invalid command mailbox reserve size"         // Returned by [newCommandMailbox] when reserveSize is 0 or exceeds the maximum slice capacity.
+	ErrCommandMailboxInvalidRegisterCommandQuota commandMailboxError = "erio: invalid register command quota"               // Returned by [newCommandMailbox] when registerCommandQuota is 0 or exceeds the maximum slice capacity.
+	ErrCommandMailboxRegisterQuotaExceeded       commandMailboxError = "erio: register command quota exceeded"              // Returned by [commandMailbox.EnqueueRegisterHandler] when registerCommandQuota registrations are already queued since the last [commandMailbox.Drain].
+	ErrCommandMailboxHandlerQuotaExceeded        commandMailboxError = "erio: handler command quota exceeded"               // Returned when a handler has already queued commandQuota commands of its [HandlerContext] since the last [commandMailbox.Drain].
+	ErrCommandMailboxNilHandler                  commandMailboxError = "erio: handler is nil"                               // Returned when a command that requires a handler is enqueued with a nil handler.
+	ErrCommandMailboxNotRegistered               commandMailboxError = "erio: handler is not registered in command mailbox" // Returned when a command is enqueued for a handler without a prior [commandMailbox.EnqueueRegisterHandler].
+	ErrCommandMailboxInvalidCommand              commandMailboxError = "erio: invalid command"                              // Returned by enqueue when the commandType is unknown.
 )
 
-// command holds a command delivered through commandMailbox and its arguments.
+// command is a single request queued for the event loop.
+// Only the fields relevant to commandType are set; the rest keep their zero value.
 type command struct {
-	commandType   commandType   // Command type.
-	handler       ClientHandler // ClientHandler that processes the command.
-	reason        error         // Close reason to pass to OnClose for commandUnregisterHandler.
-	soLinger      bool          // If true, commandUnregisterHandler closes the connection with RST.
-	timerKey      uint64        // Key that identifies the timer.
-	expiresAt     time.Time     // Timer expiration time, or the abortive close deadline for commandClose.
-	userEventData any           // User event data.
+	commandType   commandType   // Kind of request.
+	handler       ClientHandler // Target handler. nil only for commandStop.
+	reason        error         // Reason passed to the handler on commandUnregisterHandler.
+	soLinger      bool          // Close mode for commandUnregisterHandler: true aborts the connection, false closes it gracefully.
+	timerKey      uint64        // Timer identifier for commandSetTimeout and commandUnsetTimeout.
+	expiresAt     time.Time     // Timer expiration for commandSetTimeout, or the abortive close deadline for commandClose.
+	userEventData any           // Payload for commandUser.
 }
 
-// handlerCommandCount holds the pending command count of a Handler and the generation in which it
-// was recorded.
+// handlerCommandCount tracks how many quota-limited commands a handler has
+// queued in the current drain cycle.
 type handlerCommandCount struct {
-	generation uint64 // Generation in which count was recorded.
-	count      uint32 // Number of pending commands in that generation.
+	generation uint64 // Drain cycle in which count was taken. A stale generation resets count to 0.
+	count      uint32 // Quota-limited commands queued in that cycle.
 }
 
-// commandMailbox stores commands and notifies command arrival through a file descriptor.
+// commandMailbox is a thread-safe queue that carries commands from any goroutine
+// to the event loop and wakes the loop through an eventfd.
+//
+// Notes:
+//   - Commands are collected in batches. The loop takes the whole batch with [commandMailbox.Drain].
+//   - Per-handler and registration quotas apply within one batch and reset at each Drain.
+//   - The eventfd is written only when the first command of a batch is queued, so one wakeup covers the batch.
 type commandMailbox struct {
-	commandFD             internal.FileDescriptor               // File descriptor that notifies command arrival.
-	commands              []command                             // Holds the commands currently being enqueued in input order.
-	commandsSpare         []command                             // Array to swap in for enqueuing at the next Drain.
-	stopCommand           *command                              // Stop command to deliver after the regular commands.
-	registerCommandQuota  uint32                                // Maximum number of pending registration commands.
-	registerCommandCount  uint32                                // Current number of pending registration commands.
-	handlerCommandCounts  map[ClientHandler]handlerCommandCount // Registered Handlers, with the pending command count and its generation per Handler.
-	generation            uint64                                // Current generation, advanced at every Drain.
-	accessMutex           sync.Mutex                            // Protects concurrent access to the command storage, the closed state, and the immediate write state.
-	closed                bool                                  // Indicates whether commandMailbox is closed.
-	immediateWriteEnabled bool                                  // Indicates whether Write commands are collected as immediate writes while the Reactor processes events or expired timers.
-	immediateWrites       []ClientHandler                       // Holds the transmission targets enqueued as immediate writes.
-	immediateWritesSpare  []ClientHandler                       // Array to swap in for collecting at the next EndImmediateWrites.
+	commandFD             internal.FileDescriptor               // eventfd written to wake the event loop and read to clear the wakeup.
+	commands              []command                             // Commands queued since the last Drain.
+	commandsSpare         []command                             // Backing slice swapped in at Drain to avoid reallocating commands.
+	stopCommand           *command                              // Pending stop request, appended after all other commands at Drain. nil when none.
+	registerCommandQuota  uint32                                // Maximum register commands per batch.
+	registerCommandCount  uint32                                // Register commands queued in the current batch.
+	handlerCommandCounts  map[ClientHandler]handlerCommandCount // Registered handlers and their per-batch command counts.
+	generation            uint64                                // Current batch number, incremented at each Drain.
+	accessMutex           sync.Mutex                            // Guards every field below and above except commandFD.
+	closed                bool                                  // true rejects new commands with [ErrCommandMailboxClosed].
+	immediateWriteEnabled bool                                  // true routes write commands to immediateWrites instead of commands.
+	immediateWrites       []ClientHandler                       // Handlers that requested a write while immediate writes were enabled, without duplicates.
+	immediateWritesSpare  []ClientHandler                       // Backing slice swapped in at EndImmediateWrites to avoid reallocating immediateWrites.
 }
 
-// newCommandMailbox manages commands using a notification FD, two command arrays, and a quota count.
-// It does not manage the lifetime of commandFD, so it does not close that FD.
+// newCommandMailbox creates a closed [commandMailbox]; call [commandMailbox.Open] before enqueuing.
 //
-//   - commandFD: eventfd for command arrival notifications.
-//   - reserveSize: initial capacity of one command array, and it is not an enqueue limit.
-//   - registerCommandQuota: number of registration commands that can be enqueued between Drains.
+// Parameters:
+//   - commandFD is the eventfd written to wake the event loop. Must be non-negative.
+//   - reserveSize is the initial capacity of the command queue. Must be between 1 and the maximum slice capacity.
+//   - registerCommandQuota is the maximum number of register commands per batch. Must be between 1 and the
+//     maximum slice capacity.
 //
-// It returns the created commandMailbox and the creation error.
+// Returns:
+//   - The mailbox with closed true, and nil, when every parameter is valid.
+//   - [ErrCommandMailboxInvalidFileDescriptor] when commandFD is negative.
+//   - [ErrCommandMailboxInvalidRegisterCommandQuota] wrapped with the value when registerCommandQuota is out of range.
+//   - [ErrCommandMailboxInvalidReserveSize] wrapped with the value when reserveSize is out of range.
+//
+// Notes:
+//   - The caller keeps ownership of commandFD.
 func newCommandMailbox(commandFD internal.FileDescriptor, reserveSize uint32, registerCommandQuota uint32) (*commandMailbox, error) {
 	if commandFD < 0 {
 		return nil, ErrCommandMailboxInvalidFileDescriptor
@@ -115,21 +131,24 @@ func newCommandMailbox(commandFD internal.FileDescriptor, reserveSize uint32, re
 		registerCommandQuota: registerCommandQuota,
 		registerCommandCount: 0,
 		handlerCommandCounts: make(map[ClientHandler]handlerCommandCount),
-		closed:               false,
+		closed:               true,
 		immediateWrites:      make([]ClientHandler, 0, 64),
 		immediateWritesSpare: make([]ClientHandler, 0, 64),
 	}, nil
 }
 
-// Open allows calls to the Enqueue* functions.
-// If clear is true, it empties the pending commands, the Handler registry, and the immediate write
-// targets.
+// Open starts accepting commands.
 //
-//   - clear: if true, it empties the pending commands, the Handler registry, and the immediate
-//     write targets.
+// Parameters:
+//   - clear is true to discard queued commands, handler registrations, and quota counts; false keeps them.
 //
-// It returns an error if not initialized.
-// It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox.
+// Returns:
+//   - nil when the mailbox is open.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//
+// Notes:
+//   - Immediate writes are disabled on Open regardless of clear.
+//   - A pending stop request from [commandMailbox.EnqueueStop] is not cleared and is still delivered by the next [commandMailbox.Drain].
 func (this *commandMailbox) Open(clear bool) error {
 	if this.handlerCommandCounts == nil {
 		return ErrCommandMailboxUninitialized
@@ -138,7 +157,7 @@ func (this *commandMailbox) Open(clear bool) error {
 	this.accessMutex.Lock()
 	defer this.accessMutex.Unlock()
 	this.closed = false
-	// If it stopped during event processing, it clears the remaining processing state.
+
 	this.immediateWriteEnabled = false
 	if clear == true {
 		this.clear()
@@ -147,16 +166,18 @@ func (this *commandMailbox) Open(clear bool) error {
 	return nil
 }
 
-// Stop closes enqueuing of new commands.
-// It does not add a stop command and does not close the FD.
-// If clear is false, pending commands can be received at the next Drain.
+// Stop rejects further commands without queuing a stop command for the event loop.
 //
-//   - clear: if true, it empties the pending commands, the Handler registry, and the immediate
-//     write targets.
+// Parameters:
+//   - clear is true to discard queued commands, handler registrations, and quota counts; false keeps them.
 //
-// It returns an error if not initialized or already closed.
-// It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox, and
-// ErrCommandMailboxClosed if it is already closed.
+// Returns:
+//   - nil when the mailbox was open and is now closed.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox was already closed.
+//
+// Notes:
+//   - Use [commandMailbox.EnqueueStop] to also deliver a stop command to the event loop.
 func (this *commandMailbox) Stop(clear bool) error {
 	if this.handlerCommandCounts == nil {
 		return ErrCommandMailboxUninitialized
@@ -176,12 +197,14 @@ func (this *commandMailbox) Stop(clear bool) error {
 	return nil
 }
 
-// Clear empties the pending regular commands, the registration count, the Handler registry, and the
-// immediate write targets.
-// It keeps the open/closed state, the pending stop command, and the FD notification.
+// Clear discards queued commands, handler registrations, and quota counts while keeping the open or closed state.
 //
-// It returns an error if not initialized.
-// It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox.
+// Returns:
+//   - nil when cleared.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//
+// Notes:
+//   - A pending stop request from [commandMailbox.EnqueueStop] is kept.
 func (this *commandMailbox) Clear() error {
 	if this.handlerCommandCounts == nil {
 		return ErrCommandMailboxUninitialized
@@ -193,10 +216,13 @@ func (this *commandMailbox) Clear() error {
 	return nil
 }
 
-// clear erases the references in the enqueue array, the registration count, the Handler registry,
-// and the immediate write targets, and does not touch the array that has been returned and is being
-// processed.
-// It must be called within accessMutex.
+// clear empties commands, sets registerCommandCount to 0, and empties handlerCommandCounts and immediateWrites.
+//
+// Notes:
+//   - stopCommand is kept.
+//
+// Caution:
+//   - The caller must hold accessMutex.
 func (this *commandMailbox) clear() {
 	clear(this.commands)
 	this.commands = this.commands[:0]
@@ -205,14 +231,21 @@ func (this *commandMailbox) clear() {
 	clear(this.immediateWrites)
 }
 
-// EnqueueRegisterHandler enqueues a Handler registration command.
-// It uses the Register registration quota and does not use the per-connection quota.
-// It also adds the Handler to the registry with a count of 0 in the current generation.
-// It does not check the validity of the Handler.
+// EnqueueRegisterHandler queues a request to add handler to the event loop and
+// starts accepting per-handler commands for it.
 //
-//   - handler: Handler to register.
+// Parameters:
+//   - handler is the handler to register.
 //
-// It returns an error if closed, if the quota is exceeded, or if the notification fails.
+// Returns:
+//   - nil when queued.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//   - [ErrCommandMailboxRegisterQuotaExceeded] when the per-batch register quota is used up.
+//   - A write error from the eventfd when waking the event loop fails; the command is not queued.
+//
+// Notes:
+//   - Per-handler commands such as [commandMailbox.EnqueueWrite] are accepted as soon as this returns nil, before the loop drains the registration.
 func (this *commandMailbox) EnqueueRegisterHandler(handler ClientHandler) error {
 	return this.enqueue(command{
 		commandType: commandRegisterHandler,
@@ -221,15 +254,23 @@ func (this *commandMailbox) EnqueueRegisterHandler(handler ClientHandler) error 
 	})
 }
 
-// EnqueueUnregisterHandler enqueues the unregister command that closes the connection of the Handler.
-// It removes the Handler from the registry, so later Handler commands return
-// ErrCommandMailboxNotRegistered. It is not subject to the per-connection quota.
+// EnqueueUnregisterHandler queues a request to remove handler from the event loop and
+// stops accepting per-handler commands for it.
 //
-//   - handler: Handler to unregister.
-//   - reason: close reason to pass to OnClose.
-//   - soLinger: if true, the connection is closed with RST.
+// Parameters:
+//   - handler is the handler to remove.
+//   - reason is passed to the handler as the close reason.
+//   - soLinger is true to abort the connection, discarding pending data, or false to close it gracefully.
 //
-// It returns an error if closed or if the notification fails.
+// Returns:
+//   - nil when queued.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//   - A write error from the eventfd when waking the event loop fails; the command is not queued.
+//
+// Notes:
+//   - Does not check whether handler is registered.
+//   - Per-handler commands for handler fail with [ErrCommandMailboxNotRegistered] as soon as this returns.
 func (this *commandMailbox) EnqueueUnregisterHandler(handler ClientHandler, reason error, soLinger bool) error {
 	return this.enqueue(command{
 		commandType: commandUnregisterHandler,
@@ -240,13 +281,18 @@ func (this *commandMailbox) EnqueueUnregisterHandler(handler ClientHandler, reas
 	})
 }
 
-// UnregisterHandler removes the Handler from the registry without enqueuing a command.
-// It is used when the Reactor removes or rejects the Handler directly.
+// UnregisterHandler stops accepting per-handler commands for handler without queuing a command.
 //
-//   - handler: Handler to remove from the registry.
+// Parameters:
+//   - handler is the handler to forget.
 //
-// It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox, and
-// ErrCommandMailboxClosed if it is closed.
+// Returns:
+//   - nil when done, including when handler was not registered.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//
+// Notes:
+//   - Commands already queued for handler stay in the queue and are still returned by [commandMailbox.Drain].
 func (this *commandMailbox) UnregisterHandler(handler ClientHandler) error {
 	if this.handlerCommandCounts == nil {
 		return ErrCommandMailboxUninitialized
@@ -263,15 +309,21 @@ func (this *commandMailbox) UnregisterHandler(handler ClientHandler) error {
 	return nil
 }
 
-// EnqueueSetTimeout enqueues a timer set command.
-// It uses the per-connection quota of the Handler.
+// EnqueueSetTimeout queues a request to arm a timer for handler.
 //
-//   - handler: target Handler.
-//   - timerKey: timer key.
-//   - expiresAt: absolute expiration time.
+// Parameters:
+//   - handler is the registered handler that owns the timer and must not be nil.
+//   - timerKey identifies the timer and is passed back to [ClientHandler.OnTimeout].
+//   - expiresAt is the time at which the timer fires.
 //
-// It returns an error if closed, if the Handler is nil or not registered, if the quota is exceeded,
-// or if the notification fails.
+// Returns:
+//   - nil when queued.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//   - [ErrCommandMailboxNilHandler] when handler is nil.
+//   - [ErrCommandMailboxNotRegistered] when handler was not registered.
+//   - [ErrCommandMailboxHandlerQuotaExceeded] when handler used up its per-batch quota.
+//   - A write error from the eventfd when waking the event loop fails; the command is not queued.
 func (this *commandMailbox) EnqueueSetTimeout(handler ClientHandler, timerKey uint64, expiresAt time.Time) error {
 	return this.enqueue(command{
 		commandType: commandSetTimeout,
@@ -281,14 +333,20 @@ func (this *commandMailbox) EnqueueSetTimeout(handler ClientHandler, timerKey ui
 	})
 }
 
-// EnqueueUnsetTimeout enqueues a timer unset command.
-// It uses the per-connection quota of the Handler.
+// EnqueueUnsetTimeout queues a request to cancel a timer for handler.
 //
-//   - handler: target Handler.
-//   - timerKey: timer key.
+// Parameters:
+//   - handler is the registered handler that owns the timer and must not be nil.
+//   - timerKey identifies the timer to cancel.
 //
-// It returns an error if closed, if the Handler is nil or not registered, if the quota is exceeded,
-// or if the notification fails.
+// Returns:
+//   - nil when queued.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//   - [ErrCommandMailboxNilHandler] when handler is nil.
+//   - [ErrCommandMailboxNotRegistered] when handler was not registered.
+//   - [ErrCommandMailboxHandlerQuotaExceeded] when handler used up its per-batch quota.
+//   - A write error from the eventfd when waking the event loop fails; the command is not queued.
 func (this *commandMailbox) EnqueueUnsetTimeout(handler ClientHandler, timerKey uint64) error {
 	return this.enqueue(command{
 		commandType: commandUnsetTimeout,
@@ -298,16 +356,23 @@ func (this *commandMailbox) EnqueueUnsetTimeout(handler ClientHandler, timerKey 
 	})
 }
 
-// EnqueueWrite enqueues a send command.
-// It uses the per-connection quota of the Handler.
-// When immediate write (BeginImmediateWrites~EndImmediateWrites) is set,
-// it is enqueued as an immediate write target without the command queue and FD notification,
-// and in that case, the per-connection quota is not applied and it is held only once per Handler.
+// EnqueueWrite requests that the event loop write handler's pending data.
 //
-//   - handler: Handler whose data is to be sent.
+// Parameters:
+//   - handler is the registered handler with data to write and must not be nil.
 //
-// It returns an error if closed, if the Handler is nil or not registered, if the quota is exceeded,
-// or if the notification fails.
+// Returns:
+//   - nil when queued or recorded as an immediate write.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//   - [ErrCommandMailboxNilHandler] when handler is nil.
+//   - [ErrCommandMailboxNotRegistered] when handler was not registered and immediate writes are disabled.
+//   - [ErrCommandMailboxHandlerQuotaExceeded] when handler used up its per-batch quota and immediate writes are disabled.
+//   - A write error from the eventfd when waking the event loop fails; the command is not queued.
+//
+// Notes:
+//   - Between [commandMailbox.BeginImmediateWrites] and [commandMailbox.EndImmediateWrites] the request is not queued.
+//     Instead handler is recorded once, without a registration or quota check, and written by EndImmediateWrites.
 func (this *commandMailbox) EnqueueWrite(handler ClientHandler) error {
 	return this.enqueue(command{
 		commandType: commandWrite,
@@ -316,14 +381,20 @@ func (this *commandMailbox) EnqueueWrite(handler ClientHandler) error {
 	})
 }
 
-// EnqueueUserEvent enqueues a user event command.
-// It uses the per-connection quota of the Handler and does not deep-copy the data.
+// EnqueueUserEvent queues userEventData for delivery to handler through [ClientHandler.OnUserEvent].
 //
-//   - handler: target Handler.
-//   - userEventData: user event data.
+// Parameters:
+//   - handler is the registered handler that receives the event and must not be nil.
+//   - userEventData is passed to the handler unchanged and may be nil.
 //
-// It returns an error if closed, if the Handler is nil or not registered, if the quota is exceeded,
-// or if the notification fails.
+// Returns:
+//   - nil when queued.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//   - [ErrCommandMailboxNilHandler] when handler is nil.
+//   - [ErrCommandMailboxNotRegistered] when handler was not registered.
+//   - [ErrCommandMailboxHandlerQuotaExceeded] when handler used up its per-batch quota.
+//   - A write error from the eventfd when waking the event loop fails; the command is not queued.
 func (this *commandMailbox) EnqueueUserEvent(handler ClientHandler, userEventData any) error {
 	return this.enqueue(command{
 		commandType:   commandUser,
@@ -332,14 +403,21 @@ func (this *commandMailbox) EnqueueUserEvent(handler ClientHandler, userEventDat
 	})
 }
 
-// EnqueueWake enqueues a wake command.
-// It is not subject to the per-connection quota and keeps the enqueue order with other commands.
-// It requires a registered Handler. Repeated requests are combined by HandlerContext.Wake;
-// EnqueueWake itself enqueues a command on every successful call.
+// EnqueueWake queues a request to call [ClientHandler.OnWake] on handler.
 //
-//   - handler: target Handler.
+// Parameters:
+//   - handler is the registered handler to wake and must not be nil.
 //
-// It returns an error if closed, if the Handler is nil or not registered, or if the notification fails.
+// Returns:
+//   - nil when queued.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//   - [ErrCommandMailboxNilHandler] when handler is nil.
+//   - [ErrCommandMailboxNotRegistered] when handler was not registered.
+//   - A write error from the eventfd when waking the event loop fails; the command is not queued.
+//
+// Notes:
+//   - Not counted against the handler's per-batch quota.
 func (this *commandMailbox) EnqueueWake(handler ClientHandler) error {
 	return this.enqueue(command{
 		commandType: commandWake,
@@ -347,13 +425,22 @@ func (this *commandMailbox) EnqueueWake(handler ClientHandler) error {
 	})
 }
 
-// EnqueueClose enqueues a normal close command for the Handler.
-// It is not subject to the per-connection quota and keeps the enqueue order with other commands.
+// EnqueueClose queues a graceful close of handler.
 //
-//   - handler: Handler to close.
-//   - abortiveCloseDeadline: abortive close deadline calculated by Close, or zero if not set.
+// Parameters:
+//   - handler is the registered handler to close and must not be nil.
+//   - abortiveCloseDeadline is the time after which the loop gives up sending pending data and closes abortively.
 //
-// It returns an error if closed, if the Handler is nil or not registered, or if the notification fails.
+// Returns:
+//   - nil when queued.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//   - [ErrCommandMailboxNilHandler] when handler is nil.
+//   - [ErrCommandMailboxNotRegistered] when handler was not registered.
+//   - A write error from the eventfd when waking the event loop fails; the command is not queued.
+//
+// Notes:
+//   - Not counted against the handler's per-batch quota.
 func (this *commandMailbox) EnqueueClose(handler ClientHandler, abortiveCloseDeadline time.Time) error {
 	return this.enqueue(command{
 		commandType: commandClose,
@@ -362,12 +449,21 @@ func (this *commandMailbox) EnqueueClose(handler ClientHandler, abortiveCloseDea
 	})
 }
 
-// EnqueueAbortiveClose enqueues a forced (RST) close command for the Handler.
-// It is not subject to the per-connection quota and keeps the enqueue order with other commands.
+// EnqueueAbortiveClose queues an immediate close of handler that discards pending data.
 //
-//   - handler: Handler to close.
+// Parameters:
+//   - handler is the registered handler to close and must not be nil.
 //
-// It returns an error if closed, if the Handler is nil or not registered, or if the notification fails.
+// Returns:
+//   - nil when queued.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox is closed.
+//   - [ErrCommandMailboxNilHandler] when handler is nil.
+//   - [ErrCommandMailboxNotRegistered] when handler was not registered.
+//   - A write error from the eventfd when waking the event loop fails; the command is not queued.
+//
+// Notes:
+//   - Not counted against the handler's per-batch quota.
 func (this *commandMailbox) EnqueueAbortiveClose(handler ClientHandler) error {
 	return this.enqueue(command{
 		commandType: commandAbortiveClose,
@@ -375,15 +471,16 @@ func (this *commandMailbox) EnqueueAbortiveClose(handler ClientHandler) error {
 	})
 }
 
-// EnqueueStop closes enqueuing of new commands and reserves a stop command.
-// The stop command is separate from the quotas and is delivered last, after the pending regular
-// commands, at the next Drain.
-// It notifies the FD only when there are no pending regular commands.
-// If the notification fails, it reverts only the stop command and keeps the closed state.
+// EnqueueStop closes the mailbox and queues a stop command that [commandMailbox.Drain] delivers last.
 //
-// It returns an error if not initialized or if the notification fails.
-// It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox,
-// and ErrCommandMailboxClosed if it is already closed.
+// Returns:
+//   - nil when the stop command is pending, including when one was already pending.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when the mailbox was already closed.
+//   - A write error from the eventfd when waking the event loop fails; the mailbox stays closed but no stop command is pending.
+//
+// Notes:
+//   - Commands queued before this call are still delivered, ahead of the stop command.
 func (this *commandMailbox) EnqueueStop() error {
 	if this.handlerCommandCounts == nil {
 		return ErrCommandMailboxUninitialized
@@ -420,13 +517,33 @@ func (this *commandMailbox) EnqueueStop() error {
 	return nil
 }
 
-// enqueue checks the closed state within accessMutex,
-// and divides enqueuing into registration, unregistration, immediate write, per-connection, close,
-// and wake commands according to the command type.
+// enqueue takes accessMutex and dispatches command by command.commandType to the matching enqueue* function.
 //
-//   - command: command to enqueue.
+// Parameters:
+//   - command is the request to queue. command.commandType selects the validation and quota rules.
 //
-// It returns the closed error, the unknown command error, or the error of each enqueue step.
+// Returns:
+//   - nil when the command was appended to commands or recorded in immediateWrites.
+//   - [ErrCommandMailboxUninitialized] when handlerCommandCounts is nil, that is, the mailbox was not
+//     created with [newCommandMailbox].
+//   - [ErrCommandMailboxClosed] when closed is true.
+//   - [ErrCommandMailboxNilHandler] when command.handler is nil for a commandType other than
+//     commandRegisterHandler and commandUnregisterHandler.
+//   - [ErrCommandMailboxNotRegistered] when handlerCommandCounts has no entry for command.handler.
+//   - [ErrCommandMailboxRegisterQuotaExceeded] from [commandMailbox.enqueueRegisterCommand], or
+//     [ErrCommandMailboxHandlerQuotaExceeded] from [commandMailbox.enqueueHandlerCommand].
+//   - [ErrCommandMailboxInvalidCommand] when commandType matches no case.
+//   - The [commandMailbox.notifyFD] error from [commandMailbox.appendCommand].
+//
+// Notes:
+//   - commandRegisterHandler goes to [commandMailbox.enqueueRegisterCommand], commandUnregisterHandler to
+//     [commandMailbox.enqueueUnregisterCommand].
+//   - commandWrite goes to [commandMailbox.enqueueImmediateWrite] while immediateWriteEnabled is true,
+//     otherwise to [commandMailbox.enqueueHandlerCommand].
+//   - commandSetTimeout, commandUnsetTimeout, and commandUser go to enqueueHandlerCommand, which counts them
+//     against the handler's commandQuota.
+//   - commandWake, commandClose, and commandAbortiveClose check command.handler != nil and the
+//     handlerCommandCounts entry, then call [commandMailbox.appendCommand] without a quota check.
 func (this *commandMailbox) enqueue(command command) error {
 	if this.handlerCommandCounts == nil {
 		return ErrCommandMailboxUninitialized
@@ -445,8 +562,7 @@ func (this *commandMailbox) enqueue(command command) error {
 	case commandUnregisterHandler:
 		return this.enqueueUnregisterCommand(command)
 	case commandWrite:
-		// If the Reactor is processing events, it is enqueued as an immediate write without a command
-		// and FD notification.
+
 		if this.immediateWriteEnabled == true {
 			return this.enqueueImmediateWrite(command.handler)
 		}
@@ -454,7 +570,7 @@ func (this *commandMailbox) enqueue(command command) error {
 	case commandSetTimeout, commandUnsetTimeout, commandUser:
 		return this.enqueueHandlerCommand(command)
 	case commandClose, commandAbortiveClose:
-		// Close commands do not use the per-connection quota, but require a non-nil registered Handler.
+
 		if command.handler == nil {
 			return ErrCommandMailboxNilHandler
 		}
@@ -463,8 +579,7 @@ func (this *commandMailbox) enqueue(command command) error {
 		}
 		return this.appendCommand(command)
 	case commandWake:
-		// HandlerContext.Wake combines requests using HandlerContext.wake, so wake commands do not
-		// use the per-connection quota. This branch only checks the Handler and appends the command.
+
 		if command.handler == nil {
 			return ErrCommandMailboxNilHandler
 		}
@@ -477,14 +592,22 @@ func (this *commandMailbox) enqueue(command command) error {
 	}
 }
 
-// enqueueImmediateWrite holds each immediate write target only once per Handler.
-// It does not go through the command queue and FD notification. It does not apply the
-// per-connection quota.
-// It is called within accessMutex.
+// enqueueImmediateWrite appends handler to immediateWrites for [commandMailbox.EndImmediateWrites].
 //
-//   - handler: Handler whose data is to be sent.
+// Parameters:
+//   - handler is command.handler of a commandWrite. Must not be nil.
 //
-// It returns an error if the Handler is nil.
+// Returns:
+//   - nil when appended, when handler.context().immediateWrite was already true, or when handler.context()
+//     is nil.
+//   - [ErrCommandMailboxNilHandler] when handler is nil.
+//
+// Notes:
+//   - handler.context().immediateWrite is set to true on the first append and reset by EndImmediateWrites,
+//     so each handler appears at most once per [commandMailbox.BeginImmediateWrites] window.
+//
+// Caution:
+//   - The caller must hold accessMutex.
 func (this *commandMailbox) enqueueImmediateWrite(handler ClientHandler) error {
 	if handler == nil {
 		return ErrCommandMailboxNilHandler
@@ -503,12 +626,15 @@ func (this *commandMailbox) enqueueImmediateWrite(handler ClientHandler) error {
 	return nil
 }
 
-// BeginImmediateWrites starts an immediate write section.
-// Transmissions enqueued until EndImmediateWrites do not go through the command queue and eventfd
-// and are collected as immediate write targets.
+// BeginImmediateWrites makes subsequent [commandMailbox.EnqueueWrite] calls record the handler
+// for [commandMailbox.EndImmediateWrites] instead of queuing a command.
 //
-// It returns an error if not initialized.
-// It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox.
+// Returns:
+//   - nil when enabled.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//
+// Notes:
+//   - Intended for the event loop thread, so writes requested while it runs handler callbacks are performed in the same loop iteration without an eventfd wakeup.
 func (this *commandMailbox) BeginImmediateWrites() error {
 	if this.handlerCommandCounts == nil {
 		return ErrCommandMailboxUninitialized
@@ -520,16 +646,19 @@ func (this *commandMailbox) BeginImmediateWrites() error {
 	return nil
 }
 
-// EndImmediateWrites ends the immediate write section and passes the collected transmission targets
-// to writer.
-// writer is called once per Handler outside accessMutex, and the call order is not guaranteed.
-// Transmissions requested inside writer are enqueued as commands, not as immediate writes.
-// It is called by the same single consumer as Drain.
+// EndImmediateWrites disables immediate writes and calls writer for every handler recorded since
+// [commandMailbox.BeginImmediateWrites].
 //
-//   - writer: function that processes the transmission target Handler.
+// Parameters:
+//   - writer performs the write for one handler and must not be nil when any handler was recorded.
 //
-// It returns an error if not initialized.
-// It returns ErrCommandMailboxUninitialized if it was not created with newCommandMailbox.
+// Returns:
+//   - nil when done.
+//   - [ErrCommandMailboxUninitialized] when the mailbox was not created with [newCommandMailbox].
+//
+// Notes:
+//   - writer is called after accessMutex is released, so it may enqueue commands.
+//   - Each handler is passed to writer once, in the order it was first recorded.
 func (this *commandMailbox) EndImmediateWrites(writer func(ClientHandler)) error {
 	if this.handlerCommandCounts == nil {
 		return ErrCommandMailboxUninitialized
@@ -543,11 +672,10 @@ func (this *commandMailbox) EndImmediateWrites(writer func(ClientHandler)) error
 		handler.context().immediateWrite = false
 	}
 
-	this.immediateWrites = this.immediateWritesSpare[:0] // Array already emptied after its previous use
+	this.immediateWrites = this.immediateWritesSpare[:0]
 	this.immediateWritesSpare = handlers[:0]
 	this.accessMutex.Unlock()
 
-	// Callbacks inside writer may acquire accessMutex, so it is called outside the lock.
 	for _, handler := range handlers {
 		writer(handler)
 	}
@@ -556,15 +684,22 @@ func (this *commandMailbox) EndImmediateWrites(writer func(ClientHandler)) error
 	return nil
 }
 
-// enqueueRegisterCommand checks the quota of registration commands and increments the count if
-// enqueuing succeeds.
-// It also adds the Handler to the registry with a count of 0 in the current generation.
-// The count is reset in Drain and clear.
-// It is called within accessMutex.
+// enqueueRegisterCommand appends a commandRegisterHandler and adds command.handler to handlerCommandCounts.
 //
-//   - command: registration command to enqueue.
+// Parameters:
+//   - command is the commandRegisterHandler from [commandMailbox.EnqueueRegisterHandler].
 //
-// It returns an error if the quota is exceeded or if the notification fails.
+// Returns:
+//   - nil when appended.
+//   - [ErrCommandMailboxRegisterQuotaExceeded] when registerCommandCount >= registerCommandQuota.
+//   - The [commandMailbox.appendCommand] error.
+//
+// Notes:
+//   - After a successful append, handlerCommandCounts[command.handler] is set to {generation, 0} and
+//     registerCommandCount is incremented.
+//
+// Caution:
+//   - The caller must hold accessMutex.
 func (this *commandMailbox) enqueueRegisterCommand(command command) error {
 	if this.registerCommandCount >= this.registerCommandQuota {
 		return ErrCommandMailboxRegisterQuotaExceeded
@@ -579,12 +714,22 @@ func (this *commandMailbox) enqueueRegisterCommand(command command) error {
 	return nil
 }
 
-// enqueueUnregisterCommand removes the Handler from the registry and stores the unregister command.
-// It is called within accessMutex.
+// enqueueUnregisterCommand deletes command.handler from handlerCommandCounts and appends the
+// commandUnregisterHandler.
 //
-//   - command: unregister command to enqueue.
+// Parameters:
+//   - command is the commandUnregisterHandler from [commandMailbox.EnqueueUnregisterHandler].
 //
-// It returns an error if the notification fails.
+// Returns:
+//   - nil when appended.
+//   - The [commandMailbox.appendCommand] error.
+//
+// Notes:
+//   - The delete runs before appendCommand, so later commands for the handler get
+//     [ErrCommandMailboxNotRegistered] even when the append fails.
+//
+// Caution:
+//   - The caller must hold accessMutex.
 func (this *commandMailbox) enqueueUnregisterCommand(command command) error {
 	delete(this.handlerCommandCounts, command.handler)
 
@@ -595,16 +740,25 @@ func (this *commandMailbox) enqueueUnregisterCommand(command command) error {
 	return nil
 }
 
-// enqueueHandlerCommand checks the input of the Handler command and the per-connection quota,
-// and increments the count of the Handler if enqueuing succeeds. The quota is read with
-// GetCommandQuota of the Handler.
-// It is called within accessMutex.
+// enqueueHandlerCommand appends a commandWrite, commandSetTimeout, commandUnsetTimeout, or commandUser after
+// checking the handler's per-batch count in handlerCommandCounts.
 //
-//   - command: Handler command to enqueue.
+// Parameters:
+//   - command is the command to append. command.handler must not be nil.
 //
-// It returns an error if the Handler is nil, if the quota is exceeded, or if the notification
-// fails.
-// It returns ErrCommandMailboxNotRegistered if the Handler is not registered.
+// Returns:
+//   - nil when appended.
+//   - [ErrCommandMailboxNilHandler] when command.handler is nil.
+//   - [ErrCommandMailboxNotRegistered] when handlerCommandCounts has no entry for command.handler.
+//   - [ErrCommandMailboxHandlerQuotaExceeded] when entry.count >= command.handler.context().commandQuota.
+//   - The [commandMailbox.appendCommand] error.
+//
+// Notes:
+//   - When entry.generation != generation, entry is reset to {generation, 0} before the check.
+//   - entry.count is incremented and stored only after a successful appendCommand.
+//
+// Caution:
+//   - The caller must hold accessMutex.
 func (this *commandMailbox) enqueueHandlerCommand(command command) error {
 	if command.handler == nil {
 		return ErrCommandMailboxNilHandler
@@ -618,12 +772,12 @@ func (this *commandMailbox) enqueueHandlerCommand(command command) error {
 		return ErrCommandMailboxNotRegistered
 	}
 
-	// A count recorded in a previous generation has already been drained, so it is treated as 0.
 	if entry.generation != this.generation {
 		entry = handlerCommandCount{generation: this.generation, count: 0}
 	}
 
-	if entry.count >= handler.GetCommandQuota() {
+	// commandQuota is a value that does not change after creation.
+	if entry.count >= handler.context().commandQuota {
 		return ErrCommandMailboxHandlerQuotaExceeded
 	}
 
@@ -636,14 +790,21 @@ func (this *commandMailbox) enqueueHandlerCommand(command command) error {
 	return nil
 }
 
-// appendCommand stores commands in input order.
-// It notifies the FD only when there are neither pending commands nor a stop command. If the
-// notification fails, it reverts the added command.
-// It is called within accessMutex.
+// appendCommand appends command to commands and calls [commandMailbox.notifyFD] for the first command of a batch.
 //
-//   - command: command to store.
+// Parameters:
+//   - command is the validated command to append.
 //
-// It returns an error if the notification fails.
+// Returns:
+//   - nil when appended.
+//   - The notifyFD error. The appended command is removed from commands again in this case.
+//
+// Notes:
+//   - notifyFD is called only when len(commands) became 1 and stopCommand is nil. Otherwise an earlier
+//     append or [commandMailbox.EnqueueStop] has already written commandFD for this batch.
+//
+// Caution:
+//   - The caller must hold accessMutex.
 func (this *commandMailbox) appendCommand(command command) error {
 	this.commands = append(this.commands, command)
 	if len(this.commands) > 1 || this.stopCommand != nil {
@@ -660,18 +821,21 @@ func (this *commandMailbox) appendCommand(command command) error {
 	return nil
 }
 
-// Drain consumes the FD notification and returns the pending regular commands in enqueue order,
-// appending the stop command at the end if there is one.
-// It swaps the enqueue array, resets the registration count, and advances the generation so that
-// the per-Handler counts of the previous generation are treated as 0.
-// It is called by a single consumer.
-// The returned array is reused for enqueuing at the next Drain, so it must be processed and cleared
-// before the next Drain, and it is not kept or extended.
+// Drain clears the eventfd wakeup and takes every queued command, starting a new batch.
 //
-//   - errorCallback: function that receives notification consumption errors, and it is skipped if
-//     nil.
+// Parameters:
+//   - errorCallback receives the error when reading the eventfd fails and may be nil to ignore it.
 //
-// It returns nil if there are no pending commands.
+// Returns:
+//   - The queued commands in enqueue order, with a pending stop command appended last.
+//   - nil when nothing is queued or the mailbox was not created with [newCommandMailbox].
+//
+// Notes:
+//   - Resets the register quota and starts a new generation, which resets every handler's per-batch quota.
+//   - Handler registrations are kept across Drain.
+//
+// Caution:
+//   - The returned slice is reused as the queue on the next Drain. Finish processing it before calling Drain again.
 func (this *commandMailbox) Drain(errorCallback func(error)) []command {
 	if this.handlerCommandCounts == nil {
 		return nil
@@ -704,11 +868,15 @@ func (this *commandMailbox) Drain(errorCallback func(error)) []command {
 	return commands
 }
 
-// notifyFD notifies the eventfd of command arrival.
-// It retries on EINTR, and treats EAGAIN from a full counter as success because a notification
-// already exists.
+// notifyFD calls syscall.Write(commandFD, 8 bytes holding 1) to add 1 to the eventfd counter and wake epoller.Wait.
 //
-// It returns the system call error if the notification fails.
+// Returns:
+//   - nil when Write succeeded or returned EAGAIN.
+//   - os.NewSyscallError("write", err) otherwise.
+//
+// Notes:
+//   - EINTR is retried.
+//   - EAGAIN means the eventfd counter is already at its maximum, so epoller.Wait will wake anyway.
 func (this *commandMailbox) notifyFD() error {
 	notification := [8]byte{}
 	binary.NativeEndian.PutUint64(notification[:], 1)
@@ -719,7 +887,6 @@ func (this *commandMailbox) notifyFD() error {
 			continue
 		}
 
-		// If the counter is full, a read notification already exists.
 		if writeError == nil || writeError == syscall.EAGAIN {
 			return nil
 		}
@@ -728,10 +895,15 @@ func (this *commandMailbox) notifyFD() error {
 	}
 }
 
-// consumeFD consumes the eventfd notification.
-// It retries on EINTR, and treats EAGAIN with no notification as success.
+// consumeFD calls syscall.Read(commandFD, 8 bytes) to reset the eventfd counter to 0.
 //
-// It returns the system call error if consumption fails.
+// Returns:
+//   - nil when Read succeeded or returned EAGAIN.
+//   - os.NewSyscallError("read", err) otherwise.
+//
+// Notes:
+//   - EINTR is retried.
+//   - EAGAIN means the counter was already 0, so there was no pending wakeup.
 func (this *commandMailbox) consumeFD() error {
 	notification := [8]byte{}
 

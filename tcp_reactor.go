@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -11,90 +12,296 @@ import (
 	"github.com/netiogreem/erio/internal"
 )
 
-// TCPReactorError represents state, command, and connection handling errors of TCPReactor.
+// TCPReactorError is the error type returned by [TCPReactor] methods and passed to handler callbacks.
+// It is a string so that each error can be declared as a comparable constant.
 type TCPReactorError string
 
-// Error returns the error string.
+// Error returns the error message.
 //
-// It is the TCPReactor error message.
+// Returns:
+//   - The message text of the error constant.
 func (this TCPReactorError) Error() string {
 	return string(this)
 }
 
-// Lifecycle states of TCPReactor.
 const (
-	TCPReactorStateInit    internal.LifecycleStateType = iota // Ready-to-run state right after resource creation or after Init recreates the resources.
-	TCPReactorStateStart                                      // State in which StartWithCounter starts the event loop and waits for preRun.
-	TCPReactorStateRun                                        // State in which the event loop is running.
-	TCPReactorStateStop                                       // State set after WaitStop finishes the shutdown cleanup, or when preRun fails.
-	TCPReactorStateCleanup                                    // State set by Cleanup when releasing resources.
+	TCPReactorStateStopped  internal.StateGuardType = iota // Event loop is not running. The initial state and the state after cleanup.
+	TCPReactorStateStart                                   // Start succeeded and the event loop goroutine is starting.
+	TCPReactorStateRunning                                 // Event loop is processing events and commands.
+	TCPReactorStateStopping                                // Stop was requested or cleanup is in progress.
 )
 
-// Errors returned by TCPReactor.
 const (
-	ErrTCPReactorInvalidFileDescriptor       TCPReactorError = "erio: invalid tcp reactor handler file descriptor"
-	ErrTCPReactorCommand                     TCPReactorError = "erio: invalid tcp reactor command"
-	ErrTCPReactorNilHandler                  TCPReactorError = "erio: tcp reactor handler is nil"
-	ErrTCPReactorNilHandlerContext           TCPReactorError = "erio: tcp reactor handler context is nil"
-	ErrTCPReactorNilHandlerCounter           TCPReactorError = "erio: tcp reactor handler counter is nil"
-	ErrTCPReactorDuplicateFD                 TCPReactorError = "erio: tcp reactor file descriptor is already registered"
-	ErrTCPReactorCloseRequested              TCPReactorError = "erio: connection closed by Close"
-	ErrTCPReactorAbortiveClose               TCPReactorError = "erio: connection closed by AbortiveClose"
-	ErrTCPReactorAbortiveCloseTimeout        TCPReactorError = "erio: connection closed by abortive close timeout"
-	ErrTCPReactorHangup                      TCPReactorError = "erio: client connection is closed"
-	ErrTCPReactorStopped                     TCPReactorError = "erio: tcp reactor is stopped"
-	ErrTCPReactorStateNotInit                TCPReactorError = "erio: tcp reactor is not in the Init state"
-	ErrTCPReactorStateNotStart               TCPReactorError = "erio: tcp reactor is not in the Start state"
-	ErrTCPReactorStateNotInitOrStopOrCleanup TCPReactorError = "erio: tcp reactor is not in the Init or Stop or Cleanup state"
-	ErrTCPReactorStateNotRun                 TCPReactorError = "erio: tcp reactor is not in the Run state"
-	ErrTCPReactorStateNotCleanup             TCPReactorError = "erio: tcp reactor is not in the Cleanup state"
-	ErrTCPReactorUninitialized               TCPReactorError = "erio: tcp reactor is uninitialized"
-	ErrTCPReactorInvalidReadBufferSize       TCPReactorError = "erio: invalid tcp reactor read buffer size"
+	ErrTCPReactorInvalidFileDescriptor TCPReactorError = "erio: invalid tcp reactor handler file descriptor"       // Returned by [TCPReactor.RegisterHandler], or passed to [ClientHandler.OnError], when the handler's file descriptor is negative.
+	ErrTCPReactorCommand               TCPReactorError = "erio: invalid tcp reactor command"                       // Passed to errorCallback when a drained command has an unknown type.
+	ErrTCPReactorNilHandler            TCPReactorError = "erio: tcp reactor handler is nil"                        // Returned by [TCPReactor.RegisterHandler] when handler is nil, or passed to errorCallback when a drained command has no handler.
+	ErrTCPReactorNilHandlerContext     TCPReactorError = "erio: tcp reactor handler context is nil"                // Returned by [TCPReactor.RegisterHandler] when the handler's context is nil.
+	ErrTCPReactorNilHandlerCounter     TCPReactorError = "erio: tcp reactor handler counter is nil"                // Returned by [TCPReactor.StartWithCounter] when handlerCounter is nil.
+	ErrTCPReactorDuplicateFD           TCPReactorError = "erio: tcp reactor file descriptor is already registered" // Passed to [ClientHandler.OnError] when the handler's file descriptor is already registered or is the reactor's own eventfd.
+	ErrTCPReactorCloseRequested        TCPReactorError = "erio: connection closed by Close"                        // Close reason passed to [ClientHandler.OnClose] after a graceful close finished sending pending data.
+	ErrTCPReactorAbortiveClose         TCPReactorError = "erio: connection closed by AbortiveClose"                // Close reason passed to [ClientHandler.OnClose] after an abortive close.
+	ErrTCPReactorAbortiveCloseTimeout  TCPReactorError = "erio: connection closed by abortive close timeout"       // Close reason passed to [ClientHandler.OnClose] when a graceful close did not finish before its deadline.
+	ErrTCPReactorHangup                TCPReactorError = "erio: client connection is closed"                       // Close reason passed to [ClientHandler.OnClose] when epoll reports EPOLLHUP on the connection.
+	ErrTCPReactorStopped               TCPReactorError = "erio: tcp reactor is stopped"                            // Close reason passed to [ClientHandler.OnClose], or error passed to [ClientHandler.OnError] for pending registrations, when the reactor stops.
+	ErrTCPReactorAlreadyStopped        TCPReactorError = "erio: tcp reactor is already stopped"                    // Returned by [TCPReactor.WaitStopped] when the reactor was never started.
+	ErrTCPReactorStateNotStopped       TCPReactorError = "erio: tcp reactor is not in the Stopped state"           // Returned by [TCPReactor.Start] and [TCPReactor.StartWithCounter] when the reactor is already started.
+	ErrTCPReactorStateNotStart         TCPReactorError = "erio: tcp reactor is not in the Start state"             // Returned by [TCPReactor.Start] when the event loop goroutine finds the reactor in an unexpected state.
+	ErrTCPReactorStateNotRunning       TCPReactorError = "erio: tcp reactor is not in the Running state"           // Returned by [TCPReactor.Stop] when the reactor is not running, including before the first [TCPReactor.Start].
+	ErrTCPReactorUninitialized         TCPReactorError = "erio: tcp reactor is uninitialized"                      // Returned when the reactor was not created with [NewTCPReactor].
+	ErrTCPReactorInvalidReadBufferSize TCPReactorError = "erio: invalid tcp reactor read buffer size"              // Returned by [TCPReactor.Start] when readBufferSize is 0 or exceeds the maximum slice capacity.
 )
 
-// TCPReactor sequentially processes commands, send/receive, and timer callbacks of TCP connections
-// in a single event loop.
-// It must be created with NewTCPReactor, and on a zero value, methods other than HandlerCount
-// return ErrTCPReactorUninitialized.
-// RegisterHandler and RequestStop can be called from other goroutines.
+// TCPReactor runs a single-threaded epoll event loop that reads from, writes to, and times
+// out registered [ClientHandler] connections.
+//
+// Notes:
+//   - The reactor can be started again after [TCPReactor.WaitStopped] returns.
+//   - All handler callbacks run on the event loop goroutine.
+//   - Methods are safe to call from multiple goroutines.
 type TCPReactor struct {
-	// epoll
-	epoller              *internal.Epoller                         // Monitors events of the command FD and client sockets.
-	eventBatchSize       uint32                                    // Maximum number of events to receive in one epoll wait.
-	commandFD            internal.FileDescriptor                   // eventfd that wakes the epoll wait when a command is enqueued.
-	commands             *commandMailbox                           // Command queue that passes external requests to the event loop.
-	commandsReserveSize  uint32                                    // Initial reserved count of the command arrays.
-	registerCommandQuota uint32                                    // Maximum number of pending registration commands of the Reactor.
-	readBuffer           []byte                                    // Receive buffer reused for every read.
-	handlers             map[internal.FileDescriptor]ClientHandler // Per-FD Handlers registered with this Reactor.
-	handlerCounter       *atomic.Uint32                            // Handler counter that increases and decreases on client registration and removal and can be shared with other Reactors.
-	clientTimer          *clientTimer                              // Manages the nearest timer expiration time for each Handler.
-	lifecycleState       *internal.LifecycleState                  // Protects the state transitions of the run and resource management APIs.
-	started              internal.SignalVal[error]                 // Delivers the start preparation result of the event loop.
-	stopped              internal.SignalVal[error]                 // Delivers the result of unregistering command FD monitoring and updating the stop state.
-	errorCallback        func(error)                               // Delivers Reactor errors such as event wait and resource cleanup errors.
+	startMutex           sync.Mutex                   // Serializes Start calls.
+	holder               *internal.Holder[tcpReactor] // Current event loop instance, nil before the first Start.
+	eventBatchSize       uint32                       // Maximum epoll events handled per wait.
+	commandsReserveSize  uint32                       // Initial capacity of the command queue.
+	registerCommandQuota uint32                       // Maximum register commands queued per event loop iteration.
+	readBufferSize       uint32                       // Size of the read buffer shared by all handlers.
+	errorCallback        func(error)                  // Receives errors not tied to a handler callback. nil drops them.
 }
 
-// NewTCPReactor creates epoll, the command eventfd, and the Mailbox, and returns a Reactor in the
-// ready-to-run state.
+// tcpReactor is one run of the event loop owned by a [TCPReactor].
+type tcpReactor struct {
+	epoller        *internal.Epoller                         // epoll instance for connection and eventfd events.
+	commandFD      internal.FileDescriptor                   // eventfd that wakes the loop when a command is queued; -1 after cleanup.
+	commands       *commandMailbox                           // Command queue from other goroutines to the loop.
+	readBuffer     []byte                                    // Buffer reused for every read.
+	handlers       map[internal.FileDescriptor]ClientHandler // Registered handlers keyed by their socket descriptor.
+	handlerCounter *atomic.Uint32                            // Number of registered handlers; may be shared across reactors.
+	clientTimer    *clientTimer                              // Earliest timer expiration per handler.
+	state          *internal.StateGuard                      // Current lifecycle state.
+	started        internal.SignalVal[error]                 // Signaled when the loop goroutine is running, with its start error.
+	stopped        internal.SignalVal[error]                 // Signaled when cleanup finished, with the epoll and eventfd release error.
+	errorCallback  func(error)                               // Receives errors not tied to a handler callback. nil drops them.
+}
+
+// NewTCPReactor creates [TCPReactor].
 //
-//   - eventBatchSize: maximum number of events to receive in one epoll wait.
-//   - commandsReserveSize: initial reserved count for each of the two command arrays, and it must
-//     be 1 or more.
-//   - registerCommandQuota: maximum number of pending RegisterHandler requests until the event loop
-//     drains the commands.
-//   - readBufferSize: size in bytes of the receive buffer of the Reactor, and it must be 1 or more.
-//   - ErrorCallback: callback that delivers Reactor errors, and notification is skipped if it is
-//     nil.
+// Parameters:
+//   - eventBatchSize is the maximum number of epoll events handled per wait. Must be between 1 and
+//     math.MaxInt32 divided by the size of syscall.EpollEvent.
+//   - commandsReserveSize is the initial capacity of the command queue. Must be within the range
+//     accepted by [newCommandMailbox].
+//   - registerCommandQuota is the maximum number of register commands queued per event loop
+//     iteration. Must be within the range accepted by [newCommandMailbox].
+//   - readBufferSize is the size of the read buffer shared by all handlers. Must be between 1 and
+//     the maximum slice capacity.
+//   - ErrorCallback receives errors that are not tied to a handler callback, such as epoll failures.
+//     nil drops them.
 //
-// It returns the created Reactor and the creation error.
-// It returns ErrTCPReactorInvalidReadBufferSize if readBufferSize is 0 or too large.
+// Returns:
+//   - The stopped reactor.
+//
+// Notes:
+//   - The parameters are validated at [TCPReactor.Start], not here.
 func NewTCPReactor(
 	eventBatchSize uint32,
 	commandsReserveSize uint32,
 	registerCommandQuota uint32,
 	readBufferSize uint32,
-	ErrorCallback func(error)) (*TCPReactor, error) {
+	ErrorCallback func(error)) *TCPReactor {
+	return &TCPReactor{
+		startMutex:           sync.Mutex{},
+		holder:               &internal.Holder[tcpReactor]{},
+		eventBatchSize:       eventBatchSize,
+		commandsReserveSize:  commandsReserveSize,
+		registerCommandQuota: registerCommandQuota,
+		readBufferSize:       readBufferSize,
+		errorCallback:        ErrorCallback,
+	}
+}
+
+// Start starts the reactor.
+//
+// Returns:
+//   - The values of [TCPReactor.StartWithCounter] except [ErrTCPReactorNilHandlerCounter].
+func (this *TCPReactor) Start() error {
+	return this.StartWithCounter(&atomic.Uint32{})
+}
+
+// StartWithCounter starts the reactor and counts its registered handlers in handlerCounter,
+// so several reactors can share one count.
+//
+// Parameters:
+//   - handlerCounter is incremented when a handler is registered and decremented when it is removed.
+//     Pass the same counter to several reactors to count their handlers together. Must not be nil.
+//
+// Returns:
+//   - nil when the event loop is running.
+//   - [ErrTCPReactorUninitialized] when the reactor was not created with [NewTCPReactor].
+//   - [ErrTCPReactorNilHandlerCounter] when handlerCounter is nil.
+//   - [ErrTCPReactorStateNotStopped] when the previous event loop has not reached the stopped state.
+//   - [ErrTCPReactorInvalidReadBufferSize] when readBufferSize given to NewTCPReactor is out of range.
+//   - An error wrapping [syscall.EINVAL] when eventBatchSize given to NewTCPReactor is out of range.
+//   - [ErrCommandMailboxInvalidReserveSize] or [ErrCommandMailboxInvalidRegisterCommandQuota] when the
+//     matching size given to NewTCPReactor is out of range.
+//   - A system call error when creating the epoll instance or eventfd fails.
+//
+// Notes:
+//   - Returns after the reactor is ready to accept [TCPReactor.RegisterHandler].
+//   - Call [TCPReactor.WaitStopped] before starting again; [TCPReactor.Stop] alone leaves the reactor in the stopping state.
+func (this *TCPReactor) StartWithCounter(handlerCounter *atomic.Uint32) error {
+	this.startMutex.Lock()
+	defer this.startMutex.Unlock()
+
+	if this.holder == nil {
+		return ErrTCPReactorUninitialized
+	}
+
+	if handlerCounter == nil {
+		return ErrTCPReactorNilHandlerCounter
+	}
+
+	if current := this.holder.Load(); current != nil {
+		if current.IsStopped() == false {
+			return ErrTCPReactorStateNotStopped
+		}
+	}
+
+	reactor, err := newTCPReactor(this.eventBatchSize,
+		this.commandsReserveSize,
+		this.registerCommandQuota,
+		this.readBufferSize,
+		this.errorCallback)
+	if err != nil {
+		return err
+	}
+
+	if err := reactor.StartWithCounter(handlerCounter); err != nil {
+		return err
+	}
+
+	this.holder.Store(reactor)
+	return nil
+}
+
+// Stop stops the reactor. After every request submitted before Stop has been processed, each
+// registered handler receives [ClientHandler.OnClose] with [ErrTCPReactorStopped] as the close reason.
+//
+// Returns:
+//   - nil when the stop was requested.
+//   - [ErrTCPReactorUninitialized] when the reactor was not created with [NewTCPReactor].
+//   - [ErrTCPReactorStateNotRunning] when the reactor is not running, including before the first
+//     [TCPReactor.Start] and after a previous Stop.
+//   - A system call error when waking the reactor fails.
+//
+// Notes:
+//   - Returns without waiting. Call [TCPReactor.WaitStopped] to wait until the reactor has stopped.
+func (this *TCPReactor) Stop() error {
+	if this.holder == nil {
+		return ErrTCPReactorUninitialized
+	}
+
+	reactor := this.holder.Load()
+	if reactor == nil {
+		return ErrTCPReactorStateNotRunning
+	}
+
+	return reactor.Stop()
+}
+
+// WaitStopped waits until the reactor has stopped and released its epoll instance and eventfd.
+//
+// Returns:
+//   - nil when the reactor stopped and released its resources without error.
+//   - [ErrTCPReactorUninitialized] when the reactor was not created with [NewTCPReactor].
+//   - [ErrTCPReactorAlreadyStopped] when the reactor was never started.
+//   - The joined errors from releasing the epoll instance and eventfd.
+func (this *TCPReactor) WaitStopped() error {
+	if this.holder == nil {
+		return ErrTCPReactorUninitialized
+	}
+
+	reactor := this.holder.Load()
+	if reactor == nil {
+		return ErrTCPReactorAlreadyStopped
+	}
+
+	return reactor.WaitStopped()
+}
+
+// RegisterHandler requests registration of handler with the reactor. Once registered, the reactor
+// delivers the connection's events to the handler's callbacks, starting with [ClientHandler.OnConnect].
+//
+// Parameters:
+//   - handler owns an open, not yet registered socket and must not be nil.
+//
+// Returns:
+//   - nil when the handler was accepted. Registration finishes asynchronously; failures after this
+//     point are reported through [ClientHandler.OnError] only, and OnConnect and OnClose are not called.
+//   - [ErrTCPReactorUninitialized] when the reactor was not created with [NewTCPReactor].
+//   - [ErrCommandMailboxClosed] when the reactor is not started or is stopping.
+//   - [ErrTCPReactorNilHandler] when handler is nil.
+//   - [ErrTCPReactorNilHandlerContext] when the handler's context is nil.
+//   - [ErrHandlerContextAlreadyBound] when the handler is already registered with a reactor.
+//   - [ErrTCPReactorInvalidFileDescriptor] when the handler's file descriptor is negative.
+//   - [ErrCommandMailboxRegisterQuotaExceeded] when more than registerCommandQuota handlers are registered at a time.
+//   - A system call error when waking the reactor fails.
+//
+// Notes:
+//   - When an error is returned, no [ClientHandler] callback is called.
+func (this *TCPReactor) RegisterHandler(handler ClientHandler) error {
+	if this.holder == nil {
+		return ErrTCPReactorUninitialized
+	}
+
+	reactor := this.holder.Load()
+	if reactor == nil {
+		return ErrCommandMailboxClosed
+	}
+
+	return reactor.RegisterHandler(handler)
+}
+
+// HandlerCount returns the number of connected clients registered with this reactor, or the shared
+// count when started with [TCPReactor.StartWithCounter].
+//
+// Returns:
+//   - The number of registered handlers.
+//   - 0 when the reactor was never started or is a zero value.
+func (this *TCPReactor) HandlerCount() uint32 {
+	if this.holder == nil {
+		return 0
+	}
+
+	reactor := this.holder.Load()
+	if reactor == nil {
+		return 0
+	}
+
+	return reactor.HandlerCount()
+}
+
+// newTCPReactor creates a tcpReactor in [TCPReactorStateStopped] with its epoller, commandFD (an eventfd),
+// readBuffer, and commands mailbox.
+//
+// Parameters:
+//   - All parameters have the same meaning and constraints as those of [NewTCPReactor].
+//
+// Returns:
+//   - The tcpReactor and nil when [internal.NewEpoller], eventfd2, and [newCommandMailbox] all succeeded.
+//   - [ErrTCPReactorInvalidReadBufferSize] when readBufferSize is 0 or exceeds the maximum slice capacity.
+//   - The [internal.NewEpoller] error when eventBatchSize is out of range or epoll_create1 fails.
+//   - The eventfd2 system call error, joined with the epoller.Close error.
+//   - The [newCommandMailbox] error, joined with the syscall.Close(commandFD) and epoller.Close errors.
+//
+// Notes:
+//   - When eventfd2 or newCommandMailbox fails, epoller.Close is called, and commandFD is closed when it was
+//     created. Their errors are joined to the returned error.
+func newTCPReactor(
+	eventBatchSize uint32,
+	commandsReserveSize uint32,
+	registerCommandQuota uint32,
+	readBufferSize uint32,
+	errorCallback func(error)) (*tcpReactor, error) {
 	if readBufferSize == 0 || uint64(readBufferSize) > uint64(^uint(0)>>1) {
 		return nil, ErrTCPReactorInvalidReadBufferSize
 	}
@@ -109,19 +316,16 @@ func NewTCPReactor(
 		return nil, errors.Join(os.NewSyscallError("eventfd2", errNo), epoller.Close())
 	}
 
-	reactor := &TCPReactor{
-		epoller:              epoller,
-		eventBatchSize:       eventBatchSize,
-		commandsReserveSize:  commandsReserveSize,
-		registerCommandQuota: registerCommandQuota,
-		commandFD:            internal.FileDescriptor(commandFD),
-		commands:             nil,
-		readBuffer:           make([]byte, int(readBufferSize)),
-		handlers:             make(map[internal.FileDescriptor]ClientHandler),
-		handlerCounter:       &atomic.Uint32{},
-		clientTimer:          newClientTimer(),
-		lifecycleState:       internal.NewLifecycleState(TCPReactorStateInit),
-		errorCallback:        ErrorCallback,
+	reactor := &tcpReactor{
+		epoller:        epoller,
+		commandFD:      internal.FileDescriptor(commandFD),
+		commands:       nil,
+		readBuffer:     make([]byte, int(readBufferSize)),
+		handlers:       make(map[internal.FileDescriptor]ClientHandler),
+		handlerCounter: &atomic.Uint32{},
+		clientTimer:    newClientTimer(),
+		state:          internal.NewStateGuard(TCPReactorStateStopped),
+		errorCallback:  errorCallback,
 	}
 
 	commands, err := newCommandMailbox(reactor.commandFD, commandsReserveSize, registerCommandQuota)
@@ -134,95 +338,40 @@ func NewTCPReactor(
 	return reactor, nil
 }
 
-// Init releases the existing resources in the Init, Stop, or Cleanup state, recreates them with the
-// same settings, and transitions to Init.
-// If recreation fails, it remains in the Cleanup state and Init can be called again.
+// StartWithCounter calls epoller.RegisterRead(commandFD) and commands.Open(true), sets state to
+// [TCPReactorStateStart], starts [tcpReactor.run] as a goroutine, and returns started.Wait().
 //
-// It returns an error if resource cleanup or recreation fails.
-// It returns ErrTCPReactorStateNotCleanup if the state right after Cleanup is not Cleanup.
-func (this *TCPReactor) Init() error {
-	if err := this.Cleanup(); err != nil {
-		return err
-	}
-
-	return this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != TCPReactorStateCleanup {
-			return ErrTCPReactorStateNotCleanup
+// Parameters:
+//   - handlerCounter replaces the handlerCounter created by [newTCPReactor]. The caller guarantees it is not nil.
+//
+// Returns:
+//   - nil when run broadcast nil through started, that is, when it moved state to [TCPReactorStateRunning].
+//   - [ErrTCPReactorStateNotStopped] when state is not [TCPReactorStateStopped].
+//   - The epoller.RegisterRead error, joined with the syscall.Close(commandFD) and epoller.Close errors.
+//   - The commands.Open error, joined with the epoller.Unregister(commandFD), syscall.Close(commandFD), and
+//     epoller.Close errors.
+//   - [ErrTCPReactorStateNotStart] when run found state changed before it ran.
+//
+// Notes:
+//   - After a RegisterRead or Open error, commandFD and epoller are already closed, so this tcpReactor
+//     cannot be started again. [TCPReactor.StartWithCounter] creates a new one on the next call.
+func (this *tcpReactor) StartWithCounter(handlerCounter *atomic.Uint32) error {
+	if err := this.state.Access(func(state *internal.StateGuardType) error {
+		if *state != TCPReactorStateStopped {
+			return ErrTCPReactorStateNotStopped
 		}
 
-		reactor, err := NewTCPReactor(this.eventBatchSize, this.commandsReserveSize, this.registerCommandQuota, uint32(len(this.readBuffer)), this.errorCallback)
-		if err != nil {
-			return err
+		if err := this.epoller.RegisterRead(this.commandFD); err != nil {
+			return errors.Join(err,
+				os.NewSyscallError("close", syscall.Close(int(this.commandFD))),
+				this.epoller.Close())
 		}
 
-		// The state lock, run signals, shared counter, and receive buffer are kept, and the newly
-		// created resources are taken over.
-		this.epoller = reactor.epoller
-		this.commands = reactor.commands
-		this.commandFD = reactor.commandFD
-		this.handlers = reactor.handlers
-		this.clientTimer = reactor.clientTimer
-		*state = TCPReactorStateInit
-		return nil
-	})
-}
-
-// Cleanup releases the command FD and epoll resources in the Init, Stop, or Cleanup state and
-// transitions to the Cleanup state.
-// It does not close an already released command FD and epoll again.
-//
-// It returns an error if the state check or resource release fails.
-// It returns ErrTCPReactorUninitialized if it was not created with NewTCPReactor,
-// and ErrTCPReactorStateNotInitOrStopOrCleanup if it is not in the Init, Stop, or Cleanup state.
-func (this *TCPReactor) Cleanup() error {
-	if this.lifecycleState == nil {
-		return ErrTCPReactorUninitialized
-	}
-
-	return this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != TCPReactorStateInit && *state != TCPReactorStateStop && *state != TCPReactorStateCleanup {
-			return ErrTCPReactorStateNotInitOrStopOrCleanup
-		}
-
-		var closeErr error
-		if this.commandFD >= 0 {
-			closeErr = os.NewSyscallError("close", syscall.Close(int(this.commandFD)))
-			this.commandFD = -1
-		}
-
-		*state = TCPReactorStateCleanup
-		return errors.Join(closeErr, this.epoller.Close())
-	})
-}
-
-// Start starts the event loop with an independent Handler counter and waits for the start
-// preparation result.
-//
-// It returns an error if the Init state check or start preparation fails.
-func (this *TCPReactor) Start() error {
-	return this.StartWithCounter(&atomic.Uint32{})
-}
-
-// StartWithCounter connects a shared Handler counter, starts the event loop, and waits for the
-// start preparation result.
-//
-//   - handlerCounter: shared atomic counter that reflects registration and removal counts.
-//
-// It returns an error if the Init state check or start preparation fails.
-// It returns ErrTCPReactorUninitialized if it was not created with NewTCPReactor,
-// ErrTCPReactorNilHandlerCounter if handlerCounter is nil,
-// and ErrTCPReactorStateNotInit if it is not in the Init state.
-func (this *TCPReactor) StartWithCounter(handlerCounter *atomic.Uint32) error {
-	if this.lifecycleState == nil {
-		return ErrTCPReactorUninitialized
-	}
-
-	if handlerCounter == nil {
-		return ErrTCPReactorNilHandlerCounter
-	}
-	if err := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != TCPReactorStateInit {
-			return ErrTCPReactorStateNotInit
+		if err := this.commands.Open(true); err != nil {
+			return errors.Join(err,
+				this.epoller.Unregister(this.commandFD),
+				os.NewSyscallError("close", syscall.Close(int(this.commandFD))),
+				this.epoller.Close())
 		}
 
 		this.started.Reset()
@@ -235,20 +384,55 @@ func (this *TCPReactor) StartWithCounter(handlerCounter *atomic.Uint32) error {
 	}
 
 	go this.run()
-	if err := this.started.Wait(); err != nil {
-		return err
-	}
-
-	return nil
+	return this.started.Wait()
 }
 
-// preRun prepares the command Mailbox and read monitoring in the Start state, transitions to Run,
-// and delivers the result to the start waiter.
-// If the preparation fails, it transitions to Stop.
+// IsStopped reports whether the state is Stopped.
 //
-// It returns an error if the state check or start preparation fails.
-func (this *TCPReactor) preRun() error {
-	return this.lifecycleState.Access(func(state *internal.LifecycleStateType) (err error) {
+// Returns:
+//   - true when the state is [TCPReactorStateStopped].
+//   - false in every other state.
+func (this *tcpReactor) IsStopped() bool {
+	stopped := true
+	this.state.Access(func(state *internal.StateGuardType) error {
+		if *state != TCPReactorStateStopped {
+			stopped = false
+		}
+		return nil
+	})
+	return stopped
+}
+
+// State returns the current lifecycle state.
+//
+// Returns:
+//   - One of [TCPReactorStateStopped], [TCPReactorStateStart], [TCPReactorStateRunning], or [TCPReactorStateStopping].
+func (this *tcpReactor) State() internal.StateGuardType {
+	curr := TCPReactorStateStopped
+	this.state.Access(func(state *internal.StateGuardType) error {
+		curr = *state
+		return nil
+	})
+
+	return curr
+}
+
+// run is the event loop goroutine. Each iteration calls [tcpReactor.handleTimeouts], epoller.Wait,
+// [tcpReactor.handleCommands] when the event is for commandFD, [tcpReactor.handleEvent] for every event, and
+// commands.EndImmediateWrites([tcpReactor.writeImmediately]) at the end.
+//
+// Returns:
+//   - [ErrTCPReactorStateNotStart] when state is not [TCPReactorStateStart] on entry. [tcpReactor.cleanup]
+//     does not run in this case.
+//   - The [tcpReactor.cleanup] return value otherwise. The deferred cleanup overwrites the return value after
+//     the loop ends, either because handleCommands returned isStop true or because epoller.Wait returned an error.
+//
+// Notes:
+//   - Started as "go this.run()" by [tcpReactor.StartWithCounter], which discards the return value.
+//   - The state check result is broadcast through started.BroadcastWith before the loop begins.
+//   - An epoller.Wait error is passed to [tcpReactor.handleError] and ends the loop.
+func (this *tcpReactor) run() (err error) {
+	if err := this.state.Access(func(state *internal.StateGuardType) (err error) {
 		defer func() {
 			this.started.BroadcastWith(err)
 		}()
@@ -257,32 +441,14 @@ func (this *TCPReactor) preRun() error {
 			return ErrTCPReactorStateNotStart
 		}
 
-		if err := this.commands.Open(true); err != nil {
-			*state = TCPReactorStateStop
-			return err
-		}
-
-		if err := this.epoller.RegisterRead(this.commandFD); err != nil {
-			*state = TCPReactorStateStop
-			return err
-		}
-
-		*state = TCPReactorStateRun
+		*state = TCPReactorStateRunning
 		return nil
-	})
-}
-
-// run processes timer, command, and socket events in the event loop, and when stopping, cleans up
-// command enqueuing and registered connections.
-//
-// It returns the start preparation error or the shutdown cleanup result of postRun.
-func (this *TCPReactor) run() (err error) {
-	if err := this.preRun(); err != nil {
+	}); err != nil {
 		return err
 	}
 
 	defer func() {
-		err = this.postRun()
+		err = this.cleanup()
 	}()
 
 	isStop := false
@@ -311,17 +477,29 @@ func (this *TCPReactor) run() (err error) {
 			}
 		}
 
-		// Transmissions enqueued as immediate writes are performed before the next wait.
 		this.commands.EndImmediateWrites(this.writeImmediately)
 	}
 }
 
-// postRun closes command enqueuing, cleans up pending commands and registered connections, and then
-// delivers the result of unregistering command FD monitoring to the stop waiter.
-// It does not change the state.
+// cleanup sets state to [TCPReactorStateStopping], calls commands.Stop(false) and
+// [tcpReactor.discardCommands], calls [tcpReactor.removeHandler] for every handler in handlers with
+// [ErrTCPReactorStopped] and soLinger false, releases commandFD and epoller, and sets state to
+// [TCPReactorStateStopped].
 //
-// It returns the error from closing command enqueuing.
-func (this *TCPReactor) postRun() (err error) {
+// Returns:
+//   - nil when commands.Stop returned nil or [ErrCommandMailboxClosed].
+//   - The commands.Stop error otherwise.
+//
+// Notes:
+//   - The epoller.Unregister(commandFD), syscall.Close(commandFD), and epoller.Close errors are joined and
+//     broadcast through stopped.BroadcastWith, so [tcpReactor.WaitStopped] returns them. They are not returned here.
+//   - commandFD is set to -1 after it is closed.
+func (this *tcpReactor) cleanup() (err error) {
+	this.state.Access(func(state *internal.StateGuardType) error {
+		*state = TCPReactorStateStopping
+		return nil
+	})
+
 	stopError := this.commands.Stop(false)
 	if stopError != nil && !errors.Is(stopError, ErrCommandMailboxClosed) {
 		err = errors.Join(err, stopError)
@@ -332,82 +510,66 @@ func (this *TCPReactor) postRun() (err error) {
 		this.removeHandler(handler, ErrTCPReactorStopped, false)
 	}
 
-	this.stopped.BroadcastWith(this.epoller.Unregister(this.commandFD))
-	return err
-}
+	releaseError := errors.Join(this.epoller.Unregister(this.commandFD),
+		os.NewSyscallError("close", syscall.Close(int(this.commandFD))),
+		this.epoller.Close())
 
-// RequestStop closes command enqueuing of the running Reactor and requests a stop command.
-//
-// It returns an error if the run state check or enqueuing the stop command fails.
-// It returns ErrTCPReactorUninitialized if it was not created with NewTCPReactor, and
-// ErrTCPReactorStateNotRun if it is not in the Run state.
-func (this *TCPReactor) RequestStop() (err error) {
-	if this.lifecycleState == nil {
-		return ErrTCPReactorUninitialized
-	}
+	this.commandFD = -1
 
-	return this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != TCPReactorStateRun {
-			return ErrTCPReactorStateNotRun
-		}
-
-		return this.commands.EnqueueStop()
-	})
-}
-
-// WaitStop waits for the shutdown cleanup of the event loop in the Run state and then transitions
-// to Stop.
-// It does not send a stop command.
-//
-// It returns the error from unregistering command FD monitoring during shutdown cleanup and the
-// state check error.
-// It returns ErrTCPReactorUninitialized if it was not created with NewTCPReactor, and
-// ErrTCPReactorStateNotRun if it is not in the Run state.
-func (this *TCPReactor) WaitStop() error {
-	if this.lifecycleState == nil {
-		return ErrTCPReactorUninitialized
-	}
-
-	if err := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != TCPReactorStateRun {
-			return ErrTCPReactorStateNotRun
-		}
-
-		return nil
-	}); err != nil {
+	return this.state.Access(func(state *internal.StateGuardType) error {
+		*state = TCPReactorStateStopped
+		this.stopped.BroadcastWith(releaseError)
 		return err
-	}
-
-	err1 := this.stopped.Wait()
-	err2 := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		*state = TCPReactorStateStop
-		return nil
 	})
-
-	return errors.Join(err1, err2)
 }
 
-// RegisterHandler enqueues a Handler registration command, and the actual registration is processed
-// in the event loop.
+// Stop calls commands.EnqueueStop and sets state to [TCPReactorStateStopping].
 //
-//   - handler: Handler whose connection ownership is handed over to the Reactor when the
-//     registration command is enqueued successfully.
+// Returns:
+//   - nil when EnqueueStop returned nil.
+//   - [ErrTCPReactorStateNotRunning] when state is not [TCPReactorStateRunning].
+//   - The [commandMailbox.EnqueueStop] error.
 //
-// It returns an error if enqueuing fails, and after enqueuing, the registration result is delivered
-// through Handler callbacks.
-// It returns ErrTCPReactorUninitialized if it was not created with NewTCPReactor,
-// ErrTCPReactorNilHandler if handler is nil,
-// ErrTCPReactorNilHandlerContext if HandlerContext is nil, ErrHandlerContextAlreadyBound if the
-// Handler is already registered,
-// ErrTCPReactorInvalidFileDescriptor if the FD is negative, and ErrTCPReactorStopped if it is not
-// in the Run state.
-// It returns ErrCommandMailboxClosed after RequestStop and ErrTCPReactorStopped after WaitStop,
-// and ErrCommandMailboxRegisterQuotaExceeded if pending registration commands reach registerCommandQuota.
-func (this *TCPReactor) RegisterHandler(handler ClientHandler) error {
-	if this.lifecycleState == nil {
-		return ErrTCPReactorUninitialized
-	}
+// Notes:
+//   - On any error state is unchanged.
+func (this *tcpReactor) Stop() (err error) {
+	return this.state.Access(func(state *internal.StateGuardType) error {
+		if *state != TCPReactorStateRunning {
+			return ErrTCPReactorStateNotRunning
+		}
 
+		if err := this.commands.EnqueueStop(); err != nil {
+			return err
+		}
+
+		*state = TCPReactorStateStopping
+		return nil
+	})
+}
+
+// WaitStopped returns stopped.Wait(), which blocks until [tcpReactor.cleanup] has broadcast.
+//
+// Returns:
+//   - nil when epoller.Unregister(commandFD), syscall.Close(commandFD), and epoller.Close all succeeded in cleanup.
+//   - Those errors joined otherwise.
+func (this *tcpReactor) WaitStopped() error {
+	return this.stopped.Wait()
+}
+
+// RegisterHandler validates handler and calls commands.EnqueueRegisterHandler(handler).
+//
+// Parameters:
+//   - handler is the handler to register. It must not be nil, handler.context() must not be nil, and
+//     handler.context().isBound() must be false.
+//
+// Returns:
+//   - nil when EnqueueRegisterHandler returned nil.
+//   - [ErrTCPReactorNilHandler] when handler is nil.
+//   - [ErrTCPReactorNilHandlerContext] when handler.context() is nil.
+//   - [ErrHandlerContextAlreadyBound] when handler.context().isBound() is true.
+//   - [ErrTCPReactorInvalidFileDescriptor] when handler.context().fileDescriptor() is negative.
+//   - The [commandMailbox.EnqueueRegisterHandler] error.
+func (this *tcpReactor) RegisterHandler(handler ClientHandler) error {
 	if handler == nil {
 		return ErrTCPReactorNilHandler
 	}
@@ -420,40 +582,47 @@ func (this *TCPReactor) RegisterHandler(handler ClientHandler) error {
 		return ErrHandlerContextAlreadyBound
 	}
 
-	fd := handler.context().fileDescriptor()
-	if fd < 0 {
+	if handler.context().fileDescriptor() < 0 {
 		return ErrTCPReactorInvalidFileDescriptor
 	}
 
-	return this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != TCPReactorStateRun {
-			return ErrTCPReactorStopped
-		}
-
-		return this.commands.EnqueueRegisterHandler(handler)
-	})
+	return this.commands.EnqueueRegisterHandler(handler)
 }
 
-// HandlerCount returns the number of registered Handlers recorded in the shared counter.
+// HandlerCount returns handlerCounter.Load().
 //
-// If multiple Reactors share the counter, it returns the summed count, and it is 0 if there is no
-// counter.
-func (this *TCPReactor) HandlerCount() uint32 {
-	if this.handlerCounter == nil {
-		return 0
-	}
-
+// Returns:
+//   - The number of registered handlers. The count covers every reactor that shares this handlerCounter.
+func (this *tcpReactor) HandlerCount() uint32 {
 	return this.handlerCounter.Load()
 }
 
-// handleTimeouts processes expired timers and updates the next expiration time of each Handler.
-// If there are expired timers, Writes requested in OnTimeout are processed as immediate writes.
-// If the abortive close deadline of a Handler has expired, it enqueues the unregister command to
-// close the connection with RST and ErrTCPReactorAbortiveCloseTimeout. If enqueuing fails, it calls
-// OnError and removes the Handler immediately.
+// handleTimeouts calls handler.context().onTimeout for every handler returned by clientTimer.PopExpired,
+// then returns the timeout for epoller.Wait from clientTimer.NextTimeout.
 //
-// It is the epoll wait time, -1 if there is no timer, with an upper limit of MaxInt32 milliseconds.
-func (this *TCPReactor) handleTimeouts() time.Duration {
+// Returns:
+//   - -1 when clientTimer.NextTimeout reports no timer.
+//   - The clientTimer.NextTimeout value, capped at math.MaxInt32 milliseconds.
+//
+// Notes:
+//   - clientTimer holds one time per handler. That time comes from [HandlerContext.nextExpiration], which is
+//     the earlier of timer.NextExpiration and abortiveCloseDeadline. abortiveCloseDeadline is set by
+//     [HandlerContext.setAbortiveCloseDeadline] from [tcpReactor.handleCommandClose]. handleTimeouts cannot
+//     tell which one expired, so it calls [HandlerContext.onTimeout], which calls [ClientHandler.OnTimeout]
+//     for each expired timerKey and returns aborted true when abortiveCloseDeadline has passed.
+//   - When aborted is true, commands.EnqueueUnregisterHandler(handler, [ErrTCPReactorAbortiveCloseTimeout],
+//     true) is called. The loop later runs [tcpReactor.handleCommandUnregisterHandler], which calls
+//     [tcpReactor.removeHandler] with soLinger true: the socket is closed with RST and
+//     [ClientHandler.OnClose] receives [ErrTCPReactorAbortiveCloseTimeout].
+//   - When EnqueueUnregisterHandler returns an error, handler.OnError receives it and removeHandler is
+//     called directly. That is acceptable here because the deadline already means writeBuffer data and
+//     queued commands are discarded.
+//   - When aborted is false, [tcpReactor.updateClientTimer] is called with the nextExpiration and hasTimer
+//     returned by onTimeout.
+//   - The expired handlers are processed between commands.BeginImmediateWrites and
+//     commands.EndImmediateWrites([tcpReactor.writeImmediately]), so [HandlerContext.Write] calls made in
+//     OnTimeout are written before returning.
+func (this *tcpReactor) handleTimeouts() time.Duration {
 	if expired := this.clientTimer.PopExpired(); len(expired) > 0 {
 		this.commands.BeginImmediateWrites()
 		for _, handler := range expired {
@@ -482,14 +651,29 @@ func (this *TCPReactor) handleTimeouts() time.Duration {
 	return timeout
 }
 
-// writeImmediately performs the transmission enqueued as an immediate write, and registers write
-// monitoring if unsent data remains.
-// If no data remains and Close or AbortiveClose was requested, it enqueues the unregister command
-// as the close event.
+// writeImmediately is the writer passed to commands.EndImmediateWrites. It writes the writeBuffer of a
+// handler that called [HandlerContext.Write] during the current iteration.
 //
-//   - handler: target of the transmission, and it is ignored if it differs from the currently
-//     registered object.
-func (this *TCPReactor) writeImmediately(handler ClientHandler) {
+// Parameters:
+//   - handler is the handler recorded by [commandMailbox.enqueueImmediateWrite]. nil is ignored.
+//
+// Notes:
+//   - Returns when handlers[fd] is missing or holds a different handler, where fd is
+//     handler.context().fileDescriptor().
+//   - Calls [HandlerContext.onWritable], which writes writeBuffer to the socket until it is empty or write
+//     returns EAGAIN.
+//   - When onWritable returns true (data remains), epoller.RegisterWrite(fd) arms EPOLLOUT so
+//     [tcpReactor.handleEventWritable] continues the write. A RegisterWrite error is passed to handler.OnError.
+//   - When onWritable returns false and [HandlerContext.isDrainedForClose] is true,
+//     [tcpReactor.removeHandler] is not called here. Instead commands.EnqueueUnregisterHandler(handler,
+//     [ErrTCPReactorCloseRequested], handler.context().IsAbortiveClosed()) is called. The loop later drains
+//     that command in [tcpReactor.handleCommands] and runs [tcpReactor.handleCommandUnregisterHandler], which
+//     calls removeHandler: the socket is closed and [ClientHandler.OnClose] receives
+//     [ErrTCPReactorCloseRequested]. Commands for this handler that were queued earlier are drained first.
+//   - The EnqueueUnregisterHandler error is ignored. Calling removeHandler here would skip those earlier
+//     commands. The handler is removed later by [tcpReactor.handleEventHangup], by
+//     [tcpReactor.handleTimeouts] when abortiveCloseDeadline passes, or by [tcpReactor.cleanup].
+func (this *tcpReactor) writeImmediately(handler ClientHandler) {
 	if handler == nil {
 		return
 	}
@@ -513,10 +697,14 @@ func (this *TCPReactor) writeImmediately(handler ClientHandler) {
 	}
 }
 
-// handleError delivers the Reactor error if the error callback is set.
+// handleError passes err to errorCallback.
 //
-//   - err: error to deliver to the callback.
-func (this *TCPReactor) handleError(err error) {
+// Parameters:
+//   - err is the error not tied to a handler callback.
+//
+// Notes:
+//   - Does nothing when errorCallback is nil.
+func (this *tcpReactor) handleError(err error) {
 	if this.errorCallback == nil {
 		return
 	}
@@ -524,10 +712,16 @@ func (this *TCPReactor) handleError(err error) {
 	this.errorCallback(err)
 }
 
-// discardCommands discards pending commands and cleans up each not-yet-registered connection once
-// per FD.
-// Already registered FDs and the command FD are excluded from cleanup.
-func (this *TCPReactor) discardCommands() {
+// discardCommands calls commands.Drain(errorCallback) during [tcpReactor.cleanup] and rejects the
+// commandRegisterHandler commands whose handler was never added to handlers.
+//
+// Notes:
+//   - For each commandRegisterHandler whose command.handler.context().fileDescriptor() is not in handlers,
+//     not commandFD, and not negative, [tcpReactor.rejectHandler](command.handler, [ErrTCPReactorStopped])
+//     is called once per file descriptor. rejectHandler aborts the socket and passes the error to
+//     [ClientHandler.OnError].
+//   - Every other command, including commandRegisterHandler with a nil handler, is skipped.
+func (this *tcpReactor) discardCommands() {
 	descriptors := make(map[internal.FileDescriptor]struct{})
 	commands := this.commands.Drain(this.errorCallback)
 	for _, command := range commands {

@@ -1,54 +1,52 @@
 package erio
 
 import (
-	"errors"
 	"runtime"
 	"sync/atomic"
 )
 
-// TCPServerBuilderError represents an error returned by Builder.
+// TCPServerBuilderError is the error type returned by [Builder.Build].
+// It is a string so that each error can be declared as a comparable constant.
 type TCPServerBuilderError string
 
-// Error returns the error string.
+// Error returns the error message.
 //
-// Returns the Builder error message.
+// Returns:
+//   - The message text of the error constant.
 func (this TCPServerBuilderError) Error() string {
 	return string(this)
 }
 
-// Configuration errors returned by Build.
 const (
-	ErrBuilderInvalidEventBatchSize       TCPServerBuilderError = "erio: tcp reactor event batch size must be positive"
-	ErrBuilderInvalidRegisterCommandQuota TCPServerBuilderError = "erio: tcp reactor command quota must be positive"
-	ErrBuilderInvalidCommandReserveSize   TCPServerBuilderError = "erio: tcp reactor command reserve size must be positive"
-	ErrBuilderInvalidReadBufferSize       TCPServerBuilderError = "erio: tcp reactor read buffer size must be positive"
+	ErrBuilderInvalidEventBatchSize       TCPServerBuilderError = "erio: tcp reactor event batch size must be positive"     // Returned by [Builder.Build] when [ReactorParam.EventBatchSize] is 0.
+	ErrBuilderInvalidRegisterCommandQuota TCPServerBuilderError = "erio: tcp reactor command quota must be positive"        // Returned by [Builder.Build] when [ReactorParam.RegisterCommandQuota] is 0.
+	ErrBuilderInvalidCommandReserveSize   TCPServerBuilderError = "erio: tcp reactor command reserve size must be positive" // Returned by [Builder.Build] when [ReactorParam.CommandReserveSize] is 0.
+	ErrBuilderInvalidReadBufferSize       TCPServerBuilderError = "erio: tcp reactor read buffer size must be positive"     // Returned by [Builder.Build] when [ReactorParam.ReadBufferSize] is 0.
 )
 
-// ReactorParam holds the settings for the TCPReactors that Builder will create.
-// The same settings apply to all Reactors.
-// Only Count uses a default value when set to 0;
-// Build returns an error if any other numeric field is 0.
+// ReactorParam holds the settings [Builder.Build] passes to [NewTCPReactor] for every reactor of the server.
 type ReactorParam struct {
-	Count                uint32      // Number of Reactors; 0 defaults to GOMAXPROCS-1 (at least 1).
-	EventBatchSize       uint32      // Maximum number of events received per epoll wait for each Reactor.
-	CommandReserveSize   uint32      // Preallocates memory for each Reactor's command array. Double buffering uses twice the reserved size to minimize locking.
-	RegisterCommandQuota uint32      // The maximum number of RegisterHandler commands each Reactor can accept at a time. Capacity becomes available again as commands are processed internally.
-	ReadBufferSize       uint32      // Size in bytes of the receive buffer of each Reactor.
-	ErrorCallback        func(error) // Reactor error callback; nil disables notifications.
+	Count                uint32      // Number of reactors. 0 uses GOMAXPROCS - 1, at least 1.
+	EventBatchSize       uint32      // Maximum epoll events handled per wait. Must be positive.
+	CommandReserveSize   uint32      // Initial capacity of each reactor's command queue. Must be positive.
+	RegisterCommandQuota uint32      // Maximum register commands queued per event loop iteration. Must be positive.
+	ReadBufferSize       uint32      // Size of the read buffer shared by the handlers of one reactor. Must be positive.
+	ErrorCallback        func(error) // Receives reactor errors not tied to a handler callback. nil drops them.
 }
 
-// Builder stores the TCPServer configuration and creates TCPReactor, Acceptor, Acceptors, and TCPServer instances during Build.
+// Builder collects the reactor settings, listen addresses, and callbacks of a [TCPServer] and
+// creates the server with [Builder.Build].
 type Builder struct {
-	reactorParam        ReactorParam         // Reactor settings specified by WithReactor.
-	listenAddresses     []string             // Listening addresses collected in the order of WithListenAddress calls.
-	acceptErrorCallback func(error)          // Acceptor error callback.
-	factory             ClientHandlerFactory // Function that creates a ClientHandler for each accepted connection.
+	reactorParam        ReactorParam         // Settings for every reactor.
+	listenAddresses     []string             // "IP:port" literals, one acceptor each, in the order added.
+	acceptErrorCallback func(error)          // Receives accept and rejection errors from every acceptor. nil drops them.
+	factory             ClientHandlerFactory // Creates the handler for each accepted connection.
 }
 
-// NewBuilder creates a Builder with an empty configuration.
-// Listening addresses and ClientHandlerFactory should be set separately.
+// NewBuilder creates an empty [Builder].
 //
-// Returns the created Builder.
+// Returns:
+//   - A builder with no listen address, no factory, and zero reactor settings.
 func NewBuilder() *Builder {
 	return &Builder{
 		reactorParam:        ReactorParam{},
@@ -58,84 +56,78 @@ func NewBuilder() *Builder {
 	}
 }
 
-// WithReactor stores the Reactor settings.
-// Calling it again replaces the previous settings.
-// Build applies the default value for Count and validates the values.
+// WithReactor sets the reactor settings.
 //
-//   - param: Reactor settings
+// Parameters:
+//   - param replaces the settings of a previous call. It is validated at [Builder.Build].
 //
-// Returns the Builder itself for method chaining.
+// Returns:
+//   - The builder, for chaining.
 func (this *Builder) WithReactor(param ReactorParam) *Builder {
 	this.reactorParam = param
 	return this
 }
 
-// WithListenAddress adds a listening address.
-// Repeated calls register all addresses in call order;
-// Build validates the "IP:port" format; host names are not resolved and are rejected.
+// WithListenAddress adds a listen address. Each call adds one acceptor.
 //
-//   - listenAddress: Listening address in "IP:port" format; if the port is 0, a port is assigned automatically during Start
+// Parameters:
+//   - listenAddress is an "IP:port" literal as accepted by [NewAcceptor]. Port 0 picks a free port
+//     when the server starts.
 //
-// Returns the Builder itself for method chaining.
+// Returns:
+//   - The builder, for chaining.
 func (this *Builder) WithListenAddress(listenAddress string) *Builder {
 	this.listenAddresses = append(this.listenAddresses, listenAddress)
 	return this
 }
 
-// WithAcceptErrorCallback sets the callback for errors that occur while accepting
-// connections, creating Handlers, or requesting Reactor registration.
-// The callback is invoked in each Acceptor's accept loop goroutine.
+// WithAcceptErrorCallback sets the callback that receives accept and rejection errors from every acceptor.
 //
-//   - acceptErrorCallback: Error callback; nil disables notifications
+// Parameters:
+//   - acceptErrorCallback replaces the callback of a previous call. nil drops the errors.
 //
-// Returns the Builder itself for method chaining.
+// Returns:
+//   - The builder, for chaining.
 func (this *Builder) WithAcceptErrorCallback(acceptErrorCallback func(error)) *Builder {
 	this.acceptErrorCallback = acceptErrorCallback
 	return this
 }
 
-// WithClientHandlerFactory sets the function that creates a ClientHandler for each accepted connection.
+// WithClientHandlerFactory sets the factory that creates a handler for each accepted connection.
 //
-//   - factory: Function that creates a ClientHandler
+// Parameters:
+//   - factory replaces the factory of a previous call. Must not be nil at [Builder.Build].
 //
-// Returns the Builder itself for method chaining.
+// Returns:
+//   - The builder, for chaining.
 func (this *Builder) WithClientHandlerFactory(factory ClientHandlerFactory) *Builder {
 	this.factory = factory
 	return this
 }
 
-// Build validates the configuration and creates instances in the order Reactor -> Acceptors -> TCPServer.
-// It creates the Reactor's epoll and eventfd resources but does not start the server;
-// TCPServer.Start creates the listeners.
-// If it fails after creating Reactors, it calls Cleanup on all created Reactors and returns the error combined with any cleanup errors.
+// Build creates the reactors and acceptors from the collected settings and returns a [TCPServer] that owns them.
 //
-// Returns a TCPServer in the Init state on success, or an error on failure.
-// It returns the ErrBuilderInvalid* errors for invalid ReactorParam values, ErrAcceptorInvalidAddress
-// for an invalid listening address, ErrAcceptorNilFactory if factory is nil, ErrAcceptorsEmpty if
-// there are no listening addresses, ErrAcceptorsDuplicateAddress for duplicate addresses, and the
-// Reactor or TCPServer creation error.
+// Returns:
+//   - The server and nil when every setting is valid.
+//   - [ErrBuilderInvalidEventBatchSize], [ErrBuilderInvalidRegisterCommandQuota],
+//     [ErrBuilderInvalidCommandReserveSize], or [ErrBuilderInvalidReadBufferSize] when the matching
+//     [ReactorParam] field is 0.
+//   - [ErrAcceptorInvalidAddress] when a listen address is not an "IP:port" literal.
+//   - [ErrAcceptorNilFactory] when no factory was set.
+//   - [ErrAcceptorsEmpty] when no listen address was added.
+//   - [ErrAcceptorsDuplicateAddress] when two listen addresses with a non-zero port are equal.
+//   - The [NewTCPServer] error.
+//
+// Notes:
+//   - Accepted connections are registered with the reactors in round-robin order.
+//   - The other [ReactorParam] limits are checked when the server starts the reactors, not here.
 func (this *Builder) Build() (server *TCPServer, err error) {
 	param, err := this.validateParam()
 	if err != nil {
 		return nil, err
 	}
 
-	reactors, err := this.buildReactors(param)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() {
-		if err == nil {
-			return
-		}
-
-		for _, reactor := range reactors {
-			if cleanupErr := reactor.Cleanup(); cleanupErr != nil {
-				err = errors.Join(err, cleanupErr)
-			}
-		}
-	}()
+	reactors := this.buildReactors(param)
 
 	acceptors, err := this.buildAcceptors(reactors)
 	if err != nil {
@@ -145,13 +137,15 @@ func (this *Builder) Build() (server *TCPServer, err error) {
 	return NewTCPServer(acceptors, reactors...)
 }
 
-// validateParam validates and returns a copy of reactorParam.
-// If Count is 0, it sets Count to GOMAXPROCS-1 (at least 1).
-// It does not modify the stored reactorParam.
+// validateParam copies reactorParam, fills in Count when it is 0, and checks the other fields for 0.
 //
-// If EventBatchSize, RegisterCommandQuota, CommandReserveSize, or ReadBufferSize is 0, it returns an empty ReactorParam
-// and the corresponding error: ErrBuilderInvalidEventBatchSize, ErrBuilderInvalidRegisterCommandQuota,
-// ErrBuilderInvalidCommandReserveSize, or ErrBuilderInvalidReadBufferSize.
+// Returns:
+//   - The copy with Count filled in, and nil.
+//   - An empty [ReactorParam] and [ErrBuilderInvalidEventBatchSize], [ErrBuilderInvalidRegisterCommandQuota],
+//     [ErrBuilderInvalidCommandReserveSize], or [ErrBuilderInvalidReadBufferSize] when the matching field is 0.
+//
+// Notes:
+//   - Count 0 becomes uint32(max(runtime.GOMAXPROCS(0)-1, 1)).
 func (this *Builder) validateParam() (ReactorParam, error) {
 	param := this.reactorParam
 	if param.Count == 0 {
@@ -179,29 +173,19 @@ func (this *Builder) validateParam() (ReactorParam, error) {
 	return param, nil
 }
 
-// buildReactors creates param.Count TCPReactors.
-// If creation fails partway through, it calls Cleanup on all previously created Reactors.
+// buildReactors calls [NewTCPReactor] param.Count times with param.EventBatchSize, param.CommandReserveSize,
+// param.RegisterCommandQuota, param.ReadBufferSize, and param.ErrorCallback.
 //
-//   - param: Validated Reactor settings
+// Parameters:
+//   - param is the [ReactorParam] returned by [Builder.validateParam].
 //
-// Returns the list of created Reactors and, if creation fails, the creation and cleanup errors.
-func (this *Builder) buildReactors(param ReactorParam) (retReactors []*TCPReactor, err error) {
+// Returns:
+//   - The reactors in creation order.
+func (this *Builder) buildReactors(param ReactorParam) []*TCPReactor {
 	reactors := make([]*TCPReactor, 0)
 
-	defer func() {
-		if err == nil {
-			return
-		}
-
-		for _, reactor := range reactors {
-			if cleanupErr := reactor.Cleanup(); cleanupErr != nil {
-				err = errors.Join(err, cleanupErr)
-			}
-		}
-	}()
-
 	for range param.Count {
-		reactor, err := NewTCPReactor(
+		reactor := NewTCPReactor(
 			param.EventBatchSize,
 			param.CommandReserveSize,
 			param.RegisterCommandQuota,
@@ -209,28 +193,31 @@ func (this *Builder) buildReactors(param ReactorParam) (retReactors []*TCPReacto
 			param.ErrorCallback,
 		)
 
-		if err != nil {
-			return reactors, err
-		}
-
 		reactors = append(reactors, reactor)
 	}
 
-	return reactors, nil
+	return reactors
 }
 
-// buildAcceptors creates an Acceptor for each listening address and groups them into Acceptors.
-// All Acceptors share a single sequence counter to assign accepted connections to Reactors in round-robin order;
-// a connection is not reassigned to another Reactor if registration with the assigned Reactor fails.
+// buildAcceptors calls [NewAcceptor] for each element of listenAddresses and passes the result to [NewAcceptors].
 //
-//   - reactors: List of Reactors to assign connections to
+// Parameters:
+//   - reactors are the reactors from [Builder.buildReactors]. Must not be empty.
 //
-// Returns the created Acceptors, or an address error, factory error, or Acceptors creation error.
+// Returns:
+//   - The [Acceptors] and nil.
+//   - The NewAcceptor error for the first address that fails.
+//   - The NewAcceptors error, including [ErrAcceptorsEmpty] when listenAddresses is empty.
+//
+// Notes:
+//   - Every acceptor gets the same acceptedCallback, which computes
+//     index := (nextReactor.Add(1) - 1) % uint32(len(reactors)) on one shared atomic.Uint32 and calls
+//     reactors[index].RegisterHandler(handler). This is the round-robin distribution.
+//   - factory and acceptErrorCallback are passed to NewAcceptor as given to the builder.
 func (this *Builder) buildAcceptors(reactors []*TCPReactor) (*Acceptors, error) {
 	nextReactor := atomic.Uint32{}
 	nextReactor.Store(0)
 	acceptedCallback := func(handler ClientHandler) error {
-		// Assign requests from multiple accept loops using a shared sequence counter and return failures to the caller without reassignment.
 		index := (nextReactor.Add(1) - 1) % uint32(len(reactors))
 		return reactors[index].RegisterHandler(handler)
 	}

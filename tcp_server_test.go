@@ -14,12 +14,9 @@ import (
 
 func newTCPServerTestReactor(test testing.TB) *erio.TCPReactor {
 	test.Helper()
-	reactor, createError := erio.NewTCPReactor(8, 8, 8, 64, func(reactorError error) {
+	reactor := erio.NewTCPReactor(8, 8, 8, 64, func(reactorError error) {
 		test.Errorf("reactor error=%v", reactorError)
 	})
-	if createError != nil {
-		test.Fatal(createError)
-	}
 
 	return reactor
 }
@@ -38,14 +35,7 @@ func newTCPServerTest(test testing.TB, listenAddresses ...string) (*erio.TCPServ
 		return &handlerContextTestHandler{HandlerContext: context, events: events.events}, nil
 	}
 
-	// Registers the Reactor release first so that the server stop runs first.
 	var reactors []*erio.TCPReactor
-	test.Cleanup(func() {
-		for _, reactor := range reactors {
-			reactor.Cleanup()
-		}
-	})
-
 	acceptors := make([]*erio.Acceptor, 0, len(listenAddresses))
 	for _, listenAddress := range listenAddresses {
 		reactor := newTCPServerTestReactor(test)
@@ -77,7 +67,6 @@ func newTCPServerTest(test testing.TB, listenAddresses ...string) (*erio.TCPServ
 
 func TestNewTCPServerRejectsInvalidArguments(test *testing.T) {
 	reactor := newTCPServerTestReactor(test)
-	test.Cleanup(func() { reactor.Cleanup() })
 	acceptor, acceptorError := erio.NewAcceptor("127.0.0.1:0", rejectBuilderTestConnection, nil, nil)
 	if acceptorError != nil {
 		test.Fatal(acceptorError)
@@ -125,8 +114,8 @@ func TestTCPServerStateTransitions(test *testing.T) {
 	server, events := newTCPServerTest(test, "127.0.0.1:0")
 
 	// Init state
-	if stopError := server.Stop(); !errors.Is(stopError, erio.ErrTCPServerStateNotRun) {
-		test.Fatalf("Stop in Init=%v, want %v", stopError, erio.ErrTCPServerStateNotRun)
+	if stopError := server.Stop(); !errors.Is(stopError, erio.ErrTCPServerStateNotRunning) {
+		test.Fatalf("Stop in Init=%v, want %v", stopError, erio.ErrTCPServerStateNotRunning)
 	}
 
 	// Run state
@@ -134,8 +123,8 @@ func TestTCPServerStateTransitions(test *testing.T) {
 		test.Fatal(startError)
 	}
 
-	if startError := server.Start(); !errors.Is(startError, erio.ErrTCPServerStateNotInitOrStop) {
-		test.Fatalf("Start in Run=%v, want %v", startError, erio.ErrTCPServerStateNotInitOrStop)
+	if startError := server.Start(); !errors.Is(startError, erio.ErrTCPServerStateNotStopped) {
+		test.Fatalf("Start in Run=%v, want %v", startError, erio.ErrTCPServerStateNotStopped)
 	}
 
 	// Stop state
@@ -144,8 +133,8 @@ func TestTCPServerStateTransitions(test *testing.T) {
 		test.Fatal(stopError)
 	}
 
-	if stopError := server.Stop(); !errors.Is(stopError, erio.ErrTCPServerStateNotRun) {
-		test.Fatalf("Stop in Stop=%v, want %v", stopError, erio.ErrTCPServerStateNotRun)
+	if stopError := server.Stop(); !errors.Is(stopError, erio.ErrTCPServerStateNotRunning) {
+		test.Fatalf("Stop in Stop=%v, want %v", stopError, erio.ErrTCPServerStateNotRunning)
 	}
 
 	assertTestAcceptorRefused(test, listenAddress)
@@ -179,8 +168,8 @@ func TestTCPServerStartRollsBackOnAcceptorFailure(test *testing.T) {
 
 	// A failed Start rolls back the Acceptors that were started earlier and enters the Stop state.
 	assertTestAcceptorRefused(test, server.ListenAddrPorts()[0])
-	if stopError := server.Stop(); !errors.Is(stopError, erio.ErrTCPServerStateNotRun) {
-		test.Fatalf("Stop after failed Start=%v, want %v", stopError, erio.ErrTCPServerStateNotRun)
+	if stopError := server.Stop(); !errors.Is(stopError, erio.ErrTCPServerStateNotRunning) {
+		test.Fatalf("Stop after failed Start=%v, want %v", stopError, erio.ErrTCPServerStateNotRunning)
 	}
 
 	if closeError := occupier.Close(); closeError != nil {
@@ -255,7 +244,7 @@ func FuzzTCPServerLifecycle(fuzz *testing.F) {
 			if operation&1 == 0 {
 				actualError = server.Start()
 				if running {
-					expectedError = erio.ErrTCPServerStateNotInitOrStop
+					expectedError = erio.ErrTCPServerStateNotStopped
 				} else {
 					running = true
 				}
@@ -264,7 +253,7 @@ func FuzzTCPServerLifecycle(fuzz *testing.F) {
 				if running {
 					running = false
 				} else {
-					expectedError = erio.ErrTCPServerStateNotRun
+					expectedError = erio.ErrTCPServerStateNotRunning
 				}
 			}
 

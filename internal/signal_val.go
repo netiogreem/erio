@@ -17,7 +17,7 @@ func (this *SignalVal[T]) Broadcast() {
 	this.BroadcastWith(value)
 }
 
-func (this *SignalVal[T]) BroadcastWith(value T) {
+func (this *SignalVal[T]) BroadcastWith(value T) T {
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 
@@ -31,6 +31,8 @@ func (this *SignalVal[T]) BroadcastWith(value T) {
 		this.value.value = value
 		close(this.value.channel)
 	}
+
+	return value
 }
 
 func (this *SignalVal[T]) Wait() T {

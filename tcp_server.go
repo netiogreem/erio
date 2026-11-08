@@ -8,68 +8,66 @@ import (
 	"github.com/netiogreem/erio/internal"
 )
 
-// TCPServerError represents an error returned by TCPServer.
+// TCPServerError is the error type returned by [TCPServer] methods and [NewTCPServer].
+// It is a string so that each error can be declared as a comparable constant.
 type TCPServerError string
 
-// Error returns the error string.
+// Error returns the error message.
 //
-// It returns the TCPServer error message.
+// Returns:
+//   - The message text of the error constant.
 func (this TCPServerError) Error() string {
 	return string(this)
 }
 
-// Errors returned by TCPServer.
 const (
-	ErrTCPServerUninitialized      TCPServerError = "erio: tcp server is uninitialized"
-	ErrTCPServerNilAcceptors       TCPServerError = "erio: tcp server acceptors is nil"
-	ErrTCPServerEmptyReactors      TCPServerError = "erio: empty tcp server reactor list"
-	ErrTCPServerNilReactor         TCPServerError = "erio: tcp server reactor is nil"
-	ErrTCPServerDuplicateReactor   TCPServerError = "erio: duplicate tcp server reactor"
-	ErrTCPServerStateNotInitOrStop TCPServerError = "erio: tcp server is not in the Init or Stop state"
-	ErrTCPServerStateNotRun        TCPServerError = "erio: tcp server is not in the Run state"
+	ErrTCPServerUninitialized    TCPServerError = "erio: tcp server is uninitialized"               // Returned by [TCPServer.Start] and [TCPServer.Stop] when the server was not created with [NewTCPServer].
+	ErrTCPServerNilAcceptors     TCPServerError = "erio: tcp server acceptors is nil"               // Returned by [NewTCPServer] when acceptors is nil.
+	ErrTCPServerEmptyReactors    TCPServerError = "erio: empty tcp server reactor list"             // Returned by [NewTCPServer] when no reactor is given.
+	ErrTCPServerNilReactor       TCPServerError = "erio: tcp server reactor is nil"                 // Returned by [NewTCPServer] when a reactor is nil.
+	ErrTCPServerDuplicateReactor TCPServerError = "erio: duplicate tcp server reactor"              // Returned by [NewTCPServer] when the same reactor is given more than once.
+	ErrTCPServerStateNotStopped  TCPServerError = "erio: tcp server is not in the Not Stpped state" // Returned by [TCPServer.Start] when the server is not stopped.
+	ErrTCPServerStateNotRunning  TCPServerError = "erio: tcp server is not in the Running state"    // Returned by [TCPServer.Stop] when the server is not running.
 )
 
-// Lifecycle states of TCPServer.
-// It transitions in the order Init -> WaitRun -> Run -> WaitStop -> Stop, and Start can be called
-// again from Stop.
-// If Start fails, it returns to Stop.
 const (
-	TCPServerStateInit     internal.LifecycleStateType = iota // State right after creation, which allows only Start.
-	TCPServerStateStop                                        // Normally stopped state, which allows only Start.
-	TCPServerStateWaitRun                                     // State in which Start is starting the Reactors and Acceptors.
-	TCPServerStateRun                                         // State after Start succeeded, which allows only Stop.
-	TCPServerStateWaitStop                                    // State in which Stop is stopping the Acceptors and Reactors.
+	TCPServerStateStopped     internal.StateGuardType = iota // Nothing is running. The initial state, the state after [TCPServer.Stop], and the state after a failed [TCPServer.Start].
+	TCPServerStateWaitRunning                                // [TCPServer.Start] is starting the reactors and acceptors.
+	TCPServerStateRunning                                    // All reactors and acceptors are running.
+	TCPServerStateWaitStopped                                // [TCPServer.Stop] is stopping the acceptors and reactors.
 )
 
-// TCPServer manages the start and stop order of Acceptors and TCPReactors and the number of
-// registered Handlers for the whole server.
-// Start starts all Reactors and then starts accepting connections,
-// and Stop first stops accepting connections and then stops the Reactors.
-// Stop also calls Cleanup of the Reactors, so it releases the epoll and eventfd resources as well.
-// It must be created with Builder or NewTCPServer, and Start and Stop on a zero value return
-// ErrTCPServerUninitialized.
-// Start, Stop, and HandlerCount can be called from multiple goroutines, but ListenAddrPorts must
-// not be called concurrently with Start.
+// TCPServer starts and stops a group of [TCPReactor] values and an [Acceptors] group in the right
+// order, and counts the handlers registered across all its reactors.
+//
+// Notes:
+//   - Start runs the reactors first and then the acceptors; Stop runs them in the reverse order.
+//   - The server can be started again after [TCPServer.Stop] returns.
+//   - Start, Stop, and HandlerCount are safe to call from multiple goroutines.
 type TCPServer struct {
-	acceptors      *Acceptors               // Acceptors responsible for accepting connections
-	reactors       []*TCPReactor            // Copy of the Reactor pointer list received by the constructor
-	lifecycleState *internal.LifecycleState // Lock that protects the lifecycle state of the server and its transitions
-	handlerCounter atomic.Uint32            // Number of registered Handlers shared by all Reactors
+	acceptors      *Acceptors           // Acceptor group that hands accepted connections to the reactors.
+	reactors       []*TCPReactor        // Reactors in the order given to NewTCPServer.
+	state          *internal.StateGuard // Current lifecycle state; nil for a zero-value TCPServer.
+	handlerCounter atomic.Uint32        // Number of registered handlers, shared by all reactors.
 }
 
-// NewTCPServer validates the Acceptors and the Reactor list and creates a TCPServer in the Init
-// state.
-// It copies the Reactor pointer list, but the Reactor objects are shared with the caller.
-// It does not check the Reactor states, or whether the Reactors that Acceptors assign connections
-// to match this list.
+// NewTCPServer creates a [TCPServer]. The reactors and acceptors start at [TCPServer.Start].
 //
-//   - acceptors: Acceptors responsible for accepting connections
-//   - reactors: list of Reactors whose start and stop are managed
+// Parameters:
+//   - acceptors is the acceptor group to start and stop with the server. Must not be nil.
+//   - reactors are the reactors to start and stop with the server. At least one is required, and
+//     none may be nil or given twice.
 //
-// It returns ErrTCPServerNilAcceptors if acceptors is nil, ErrTCPServerEmptyReactors if the list is
-// empty,
-// ErrTCPServerNilReactor if it contains nil, and ErrTCPServerDuplicateReactor if it contains
-// duplicate pointers.
+// Returns:
+//   - The stopped server and nil.
+//   - [ErrTCPServerNilAcceptors] when acceptors is nil.
+//   - [ErrTCPServerEmptyReactors] when no reactor is given.
+//   - [ErrTCPServerNilReactor] when a reactor is nil.
+//   - [ErrTCPServerDuplicateReactor] when the same reactor is given more than once.
+//
+// Notes:
+//   - The reactor slice is copied, so changing the caller's slice afterwards has no effect.
+//   - It is not checked whether the acceptors register their connections with these reactors.
 func NewTCPServer(acceptors *Acceptors, reactors ...*TCPReactor) (*TCPServer, error) {
 	if acceptors == nil {
 		return nil, ErrTCPServerNilAcceptors
@@ -95,91 +93,90 @@ func NewTCPServer(acceptors *Acceptors, reactors ...*TCPReactor) (*TCPServer, er
 	return &TCPServer{
 		acceptors:      acceptors,
 		reactors:       append([]*TCPReactor(nil), reactors...),
-		lifecycleState: internal.NewLifecycleState(TCPServerStateInit),
+		state:          internal.NewStateGuard(TCPServerStateStopped),
 		handlerCounter: atomic.Uint32{},
 	}, nil
 }
 
-// Start starts all Reactors with the shared Handler counter and then starts the Acceptors.
-// It starts only in the Init or Stop state. When starting from the Stop state, it reinitializes all
-// Reactors with Init.
-// If everything succeeds, it transitions to Run, and if starting the Reactors or Acceptors fails,
-// it stops and releases all Reactors with stopReactors and transitions to Stop.
+// Start starts every reactor with the shared handler counter, then starts the acceptors.
 //
-// It returns ErrTCPServerUninitialized if not initialized, ErrTCPServerStateNotInitOrStop if not in
-// the Init or Stop state,
-// the error itself if Reactor initialization fails, and the start error joined with the state
-// transition error if starting fails.
+// Returns:
+//   - nil when all reactors and acceptors are running.
+//   - [ErrTCPServerUninitialized] when the server was not created with [NewTCPServer].
+//   - [ErrTCPServerStateNotStopped] when the server is not stopped.
+//   - The [TCPReactor.StartWithCounter] error of the first reactor that fails to start.
+//   - The [Acceptors.Start] error when the reactors started but the acceptors did not.
+//
+// Notes:
+//   - On a start error the reactors already started are stopped again and the server returns to
+//     the stopped state, so Start can be retried.
+//   - Returns after every acceptor is accepting connections.
 func (this *TCPServer) Start() error {
-	if this.lifecycleState == nil {
+	if this.state == nil {
 		return ErrTCPServerUninitialized
 	}
 
-	if err := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != TCPServerStateInit && *state != TCPServerStateStop {
-			return ErrTCPServerStateNotInitOrStop
+	if err := this.state.Access(func(state *internal.StateGuardType) error {
+		if *state != TCPServerStateStopped {
+			return ErrTCPServerStateNotStopped
 		}
 
-		if *state == TCPServerStateStop {
-			for _, reactor := range this.reactors {
-				if err := reactor.Init(); err != nil {
-					return err
-				}
-			}
-		}
-
-		*state = TCPServerStateWaitRun
+		*state = TCPServerStateWaitRunning
 		return nil
 	}); err != nil {
 		return err
 	}
 
-	var startError error
+	var errs error
 	for _, reactor := range this.reactors {
 		if err := reactor.StartWithCounter(&this.handlerCounter); err != nil {
-			startError = err
+			errs = errors.Join(errs, err)
 			break
 		}
 	}
 
-	if startError == nil {
-		startError = this.acceptors.Start()
+	if errs == nil {
+		errs = errors.Join(errs, this.acceptors.Start())
 	}
 
-	if startError != nil {
+	if errs != nil {
 		this.stopReactors()
-		stateError := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-			*state = TCPServerStateStop
-			return nil
-		})
 
-		return errors.Join(startError, stateError)
+		return this.state.Access(func(state *internal.StateGuardType) error {
+			*state = TCPServerStateStopped
+			return errs
+		})
 	}
 
-	return this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		*state = TCPServerStateRun
+	return this.state.Access(func(state *internal.StateGuardType) error {
+		*state = TCPServerStateRunning
 		return nil
 	})
 }
 
-// Stop stops only in the Run state.
-// After stopping accepting connections, it stops and releases all Reactors with stopReactors, and
-// transitions to Stop regardless of the stop results.
+// Stop stops accepting connections, then stops every reactor and waits until they have released
+// their epoll instances and eventfds.
 //
-// It returns ErrTCPServerUninitialized if not initialized and ErrTCPServerStateNotRun if not in the
-// Run state,
-// and otherwise returns nil regardless of the stop results of the Acceptors and Reactors.
+// Returns:
+//   - nil when the server is stopped.
+//   - [ErrTCPServerUninitialized] when the server was not created with [NewTCPServer].
+//   - [ErrTCPServerStateNotRunning] when the server is not running.
+//
+// Notes:
+//   - Every registered handler receives [ClientHandler.OnClose] with [ErrTCPReactorStopped] before Stop returns.
+//   - Errors from [Acceptors.Stop], [TCPReactor.Stop], and [TCPReactor.WaitStopped] are dropped; the
+//     server moves to the stopped state regardless.
 func (this *TCPServer) Stop() error {
-	if this.lifecycleState == nil {
+	if this.state == nil {
 		return ErrTCPServerUninitialized
 	}
 
-	if err := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if *state != TCPServerStateRun {
-			return ErrTCPServerStateNotRun
+	if err := this.state.Access(func(state *internal.StateGuardType) error {
+		if *state != TCPServerStateRunning {
+			return ErrTCPServerStateNotRunning
 		}
 
-		*state = TCPServerStateWaitStop
+		*state = TCPServerStateWaitStopped
 		return nil
 	}); err != nil {
 		return err
@@ -188,43 +185,47 @@ func (this *TCPServer) Stop() error {
 	this.acceptors.Stop()
 	this.stopReactors()
 
-	this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		*state = TCPServerStateStop
+	this.state.Access(func(state *internal.StateGuardType) error {
+		*state = TCPServerStateStopped
 		return nil
 	})
 
 	return nil
 }
 
-// HandlerCount returns the number of registered Handlers shared by all Reactors.
+// HandlerCount returns the number of handlers registered across all reactors of the server.
 //
-// It returns the number of registered Handlers for the whole server.
+// Returns:
+//   - The shared handler count. 0 before the first [TCPServer.Start] and after every handler is closed.
 func (this *TCPServer) HandlerCount() uint32 {
 	return this.handlerCounter.Load()
 }
 
-// ListenAddrPorts returns the list of listen addresses in registration order.
-// After Start succeeds, addresses registered with port 0 are also returned with the actually
-// assigned port.
+// ListenAddrPorts returns the listen address of each acceptor.
 //
-// It returns the list of listen addresses.
+// Returns:
+//   - The addresses in the order the acceptors were given to [NewAcceptors]. After a successful
+//     [TCPServer.Start] these are the bound addresses, with port 0 replaced by the assigned port.
+//
+// Caution:
+//   - Panics on a zero-value TCPServer because acceptors is nil.
 func (this *TCPServer) ListenAddrPorts() []netip.AddrPort {
 	return this.acceptors.ListenAddrPorts()
 }
 
-// stopReactors requests RequestStop on all Reactors, waits for WaitStop of all Reactors,
-// and then calls Cleanup on all Reactors.
-// It does not check the result of each call.
+// stopReactors calls [TCPReactor.Stop] on every element of reactors, then [TCPReactor.WaitStopped] on every element.
+//
+// Notes:
+//   - All Stop calls run before any WaitStopped, so the event loops shut down concurrently.
+//   - The return values of both calls are discarded. A reactor that was never started returns
+//     [ErrTCPReactorStateNotRunning] from Stop and [ErrTCPReactorAlreadyStopped] from WaitStopped, and
+//     that is how a failed [TCPServer.Start] skips the reactors it did not reach.
 func (this *TCPServer) stopReactors() {
 	for _, reactor := range this.reactors {
-		reactor.RequestStop()
+		reactor.Stop()
 	}
 
 	for _, reactor := range this.reactors {
-		reactor.WaitStop()
-	}
-
-	for _, reactor := range this.reactors {
-		reactor.Cleanup()
+		reactor.WaitStopped()
 	}
 }

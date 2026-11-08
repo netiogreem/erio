@@ -7,55 +7,63 @@ import (
 	"github.com/netiogreem/erio/internal"
 )
 
-// AcceptorsError represents an error returned by Acceptors.
+// AcceptorsError is the error type returned by [Acceptors] methods.
+// It is a string so that each error can be declared as a comparable constant.
 type AcceptorsError string
 
-// Error returns the error string.
+// Error returns the error message.
 //
-// It returns the Acceptors error message.
+// Returns:
+//   - The message text of the error constant.
 func (this AcceptorsError) Error() string {
 	return string(this)
 }
 
-// Errors returned by Acceptors.
 const (
-	ErrAcceptorsEmpty            AcceptorsError = "erio: empty acceptor list"
-	ErrAcceptorsNilAcceptor      AcceptorsError = "erio: acceptor is nil"
-	ErrAcceptorsDuplicate        AcceptorsError = "erio: duplicate acceptor"
-	ErrAcceptorsDuplicateAddress AcceptorsError = "erio: duplicate listen address"
-	ErrAcceptorsUninitialized    AcceptorsError = "erio: acceptors are uninitialized"
-	ErrAcceptorsStateNotStop     AcceptorsError = "erio: acceptors are not in the Stop state"
-	ErrAcceptorsStateNotRun      AcceptorsError = "erio: acceptors are not in the Run state"
+	ErrAcceptorsEmpty            AcceptorsError = "erio: empty acceptor list"                 // Returned by [NewAcceptors] when no acceptor is given.
+	ErrAcceptorsNilAcceptor      AcceptorsError = "erio: acceptor is nil"                     // Returned by [NewAcceptors] when an acceptor is nil.
+	ErrAcceptorsDuplicate        AcceptorsError = "erio: duplicate acceptor"                  // Returned by [NewAcceptors] when the same [Acceptor] is given more than once.
+	ErrAcceptorsDuplicateAddress AcceptorsError = "erio: duplicate listen address"            // Returned by [NewAcceptors] when two acceptors have the same non-zero-port listen address.
+	ErrAcceptorsUninitialized    AcceptorsError = "erio: acceptors are uninitialized"         // Returned when the group was not created with [NewAcceptors].
+	ErrAcceptorsStateNotStop     AcceptorsError = "erio: acceptors are not in the Stop state" // Returned by [Acceptors.Start] when the group is not stopped.
+	ErrAcceptorsStateNotRun      AcceptorsError = "erio: acceptors are not in the Run state"  // Returned by [Acceptors.Stop] when the group is not running.
 )
 
-// Lifecycle states of Acceptors.
-// It transitions in the order Stop -> WaitRun -> Run -> WaitStop -> Stop,
-// and if Start fails, it returns from WaitRun to Stop.
 const (
-	AcceptorsStateStop     internal.LifecycleStateType = iota // State right after creation, after a Start failure, or after Stop completes.
-	AcceptorsStateWaitRun                                     // State in which Start is starting the Acceptors one by one.
-	AcceptorsStateRun                                         // State in which all Acceptors have finished starting.
-	AcceptorsStateWaitStop                                    // State in which Stop is stopping the Acceptors.
+	AcceptorsStateStopped     internal.StateGuardType = iota // No acceptor is running. The initial state and the state after [Acceptors.Stop].
+	AcceptorsStateWaitRunning                                // [Acceptors.Start] is starting the acceptors.
+	AcceptorsStateRunning                                    // All acceptors are running.
+	AcceptorsStateWaitStopped                                // [Acceptors.Stop] is stopping the acceptors.
 )
 
-// Acceptors manages the start, stop, and listen address lookup of multiple Acceptors together.
-// It must be created with NewAcceptors, and Start and Stop on a zero value return
-// ErrAcceptorsUninitialized.
+// Acceptors starts and stops a group of [Acceptor] values together.
+//
+// Notes:
+//   - Start and Stop are all-or-nothing: when one acceptor fails to start, the ones already
+//     started are stopped again.
+//   - Methods are safe to call from multiple goroutines.
 type Acceptors struct {
-	acceptors      []*Acceptor              // Copy of the Acceptor pointer list received by the constructor
-	lifecycleState *internal.LifecycleState // Lock that protects the lifecycle state of the group and its transitions
+	acceptors []*Acceptor          // Acceptors in the order given to NewAcceptors.
+	state     *internal.StateGuard // Current lifecycle state; nil for a zero-value Acceptors.
 }
 
-// NewAcceptors validates the Acceptor list and creates Acceptors in the Stop state.
-// Duplicate listen addresses are checked with ListenAddrPort at creation time,
-// and addresses with port 0 are excluded from the duplicate check because each is assigned a port
-// when started.
+// NewAcceptors creates an [Acceptors] group. The acceptors start listening at [Acceptors.Start].
 //
-//   - acceptors: list of Acceptors to group
+// Parameters:
+//   - acceptors are the acceptors to group, started and stopped in this order. At least one is
+//     required, none may be nil or given twice, and no two may listen on the same address with a
+//     non-zero port.
 //
-// It returns ErrAcceptorsEmpty if the list is empty, ErrAcceptorsNilAcceptor if it contains nil,
-// ErrAcceptorsDuplicate if it contains duplicate pointers, and ErrAcceptorsDuplicateAddress if it
-// contains duplicate addresses.
+// Returns:
+//   - The stopped group and nil.
+//   - [ErrAcceptorsEmpty] when no acceptor is given.
+//   - [ErrAcceptorsNilAcceptor] when an acceptor is nil.
+//   - [ErrAcceptorsDuplicate] when the same acceptor is given more than once.
+//   - [ErrAcceptorsDuplicateAddress] when two acceptors have the same listen address with a non-zero port.
+//
+// Notes:
+//   - The slice is copied, so changing the caller's slice afterwards has no effect.
+//   - Addresses are compared using [Acceptor.ListenAddrPort] at construction time.
 func NewAcceptors(acceptors ...*Acceptor) (*Acceptors, error) {
 	if len(acceptors) == 0 {
 		return nil, ErrAcceptorsEmpty
@@ -77,8 +85,7 @@ func NewAcceptors(acceptors ...*Acceptor) (*Acceptors, error) {
 	addresses := make(map[netip.AddrPort]struct{}, len(acceptors))
 	for _, acceptor := range acceptors {
 		address := acceptor.ListenAddrPort()
-		// Port 0 is excluded from the address duplicate check because each is assigned its own port
-		// at start.
+
 		if address.Port() == 0 {
 			continue
 		}
@@ -91,66 +98,66 @@ func NewAcceptors(acceptors ...*Acceptor) (*Acceptors, error) {
 	}
 
 	return &Acceptors{
-		acceptors:      append([]*Acceptor(nil), acceptors...),
-		lifecycleState: internal.NewLifecycleState(AcceptorsStateStop),
+		acceptors: append([]*Acceptor(nil), acceptors...),
+		state:     internal.NewStateGuard(AcceptorsStateStopped),
 	}, nil
 }
 
-// Start starts all Acceptors in registration order.
-// It starts only in the Stop state and transitions to Run when all have started.
-// If any of them fails to start, it stops the Acceptors started before it and returns to Stop.
+// Start starts every acceptor in order.
 //
-// It returns ErrAcceptorsUninitialized if not initialized, ErrAcceptorsStateNotStop if not in the
-// Stop state, and the start error joined with the stop errors if starting fails.
+// Returns:
+//   - nil when all acceptors are running.
+//   - [ErrAcceptorsUninitialized] when the group was not created with [NewAcceptors].
+//   - [ErrAcceptorsStateNotStop] when the group is not stopped.
+//   - The [Acceptor.Start] error joined with any errors from stopping the acceptors started
+//     before it; the group returns to the stopped state.
 func (this *Acceptors) Start() error {
-	if err := this.beginTransition(AcceptorsStateStop, AcceptorsStateWaitRun, ErrAcceptorsStateNotStop); err != nil {
+	if err := this.beginTransition(AcceptorsStateStopped, AcceptorsStateWaitRunning, ErrAcceptorsStateNotStop); err != nil {
 		return err
 	}
 
-	startError := this.startAcceptors()
-	stateError := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		if startError != nil {
-			*state = AcceptorsStateStop
-			return nil
+	err := this.startAcceptors()
+	return this.state.Access(func(state *internal.StateGuardType) error {
+		if err != nil {
+			*state = AcceptorsStateStopped
+			return err
 		}
 
-		*state = AcceptorsStateRun
+		*state = AcceptorsStateRunning
 		return nil
 	})
-
-	return errors.Join(startError, stateError)
 }
 
-// Stop stops all Acceptors and transitions to Stop.
-// It stops only in the Run state,
-// and first requests RequestStop on all Acceptors, then waits for WaitStop of the Acceptors whose
-// request succeeded.
-// Even if stopping an individual Acceptor fails, it continues stopping the rest, and the group
-// transitions to Stop.
+// Stop stops every acceptor and waits until their accept goroutines have exited.
 //
-// It returns ErrAcceptorsUninitialized if not initialized, ErrAcceptorsStateNotRun if not in the
-// Run state, and the individual stop errors joined together.
+// Returns:
+//   - nil when all acceptors are stopped.
+//   - [ErrAcceptorsUninitialized] when the group was not created with [NewAcceptors].
+//   - [ErrAcceptorsStateNotRun] when the group is not running.
+//   - The joined errors from [Acceptor.Stop] and [Acceptor.WaitStopped]; the group still
+//     moves to the stopped state.
 func (this *Acceptors) Stop() error {
-	if err := this.beginTransition(AcceptorsStateRun, AcceptorsStateWaitStop, ErrAcceptorsStateNotRun); err != nil {
+	if err := this.beginTransition(AcceptorsStateRunning, AcceptorsStateWaitStopped, ErrAcceptorsStateNotRun); err != nil {
 		return err
 	}
 
 	stopError := stopAcceptors(this.acceptors)
-	stateError := this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
-		*state = AcceptorsStateStop
+	stateError := this.state.Access(func(state *internal.StateGuardType) error {
+		*state = AcceptorsStateStopped
 		return nil
 	})
 
 	return errors.Join(stopError, stateError)
 }
 
-// ListenAddrPorts collects and returns the listen address of each Acceptor in registration order.
-// After Start succeeds, addresses registered with port 0 are also returned with the actually
-// assigned port.
+// ListenAddrPorts returns the listen address of each acceptor.
 //
-// It returns the list of listen addresses, and nil if not initialized.
+// Returns:
+//   - The addresses in the order the acceptors were given to [NewAcceptors]. After a successful
+//     [Acceptors.Start] these are the bound addresses, with port 0 replaced by the assigned port.
+//   - nil for a zero-value Acceptors.
 func (this *Acceptors) ListenAddrPorts() (listenAddrPorts []netip.AddrPort) {
-	if this.lifecycleState == nil {
+	if this.state == nil {
 		return nil
 	}
 
@@ -161,19 +168,24 @@ func (this *Acceptors) ListenAddrPorts() (listenAddrPorts []netip.AddrPort) {
 	return listenAddrPorts
 }
 
-// beginTransition transitions to next within the lock if the current state is expected.
+// beginTransition moves state from expected to next inside state.Access.
 //
-//   - expected: state expected before the transition
-//   - next: state to transition to
-//   - stateError: error to return when the current state is not expected
+// Parameters:
+//   - expected is the state the group must be in. [Acceptors.Start] passes [AcceptorsStateStopped],
+//     [Acceptors.Stop] passes [AcceptorsStateRunning].
+//   - next is the state stored when the current state equals expected.
+//   - stateError is returned when the current state differs from expected.
 //
-// It returns ErrAcceptorsUninitialized if not initialized, and stateError if the state differs.
-func (this *Acceptors) beginTransition(expected internal.LifecycleStateType, next internal.LifecycleStateType, stateError error) error {
-	if this.lifecycleState == nil {
+// Returns:
+//   - nil when state is now next.
+//   - [ErrAcceptorsUninitialized] when state is nil.
+//   - stateError when the current state differs from expected. state is unchanged.
+func (this *Acceptors) beginTransition(expected internal.StateGuardType, next internal.StateGuardType, stateError error) error {
+	if this.state == nil {
 		return ErrAcceptorsUninitialized
 	}
 
-	return this.lifecycleState.Access(func(state *internal.LifecycleStateType) error {
+	return this.state.Access(func(state *internal.StateGuardType) error {
 		if *state != expected {
 			return stateError
 		}
@@ -183,11 +195,15 @@ func (this *Acceptors) beginTransition(expected internal.LifecycleStateType, nex
 	})
 }
 
-// startAcceptors starts the Acceptors in registration order.
-// It stops at the first Acceptor that fails and stops the Acceptors started before it with
-// stopAcceptors.
+// startAcceptors calls [Acceptor.Start] on each element of acceptors in order and stops at the first error.
 //
-// It returns the start error joined with the stop errors.
+// Returns:
+//   - nil when every Start returned nil.
+//   - errors.Join(Start error, [stopAcceptors](acceptors[:index]) error) for the first acceptor whose Start
+//     failed, where index is its position.
+//
+// Notes:
+//   - After an error no acceptor of the group is running, because stopAcceptors stopped the ones before index.
 func (this *Acceptors) startAcceptors() error {
 	for index, acceptor := range this.acceptors {
 		if err := acceptor.Start(); err != nil {
@@ -198,19 +214,26 @@ func (this *Acceptors) startAcceptors() error {
 	return nil
 }
 
-// stopAcceptors requests RequestStop on all Acceptors in the list, then waits for WaitStop of the
-// Acceptors whose request succeeded.
-// Even if an individual Acceptor fails, it continues processing the rest.
+// stopAcceptors calls [Acceptor.Stop] on every acceptor, then [Acceptor.WaitStopped] on those whose Stop
+// returned nil.
 //
-//   - acceptors: list of Acceptors to stop
+// Parameters:
+//   - acceptors are the acceptors to stop. May be empty.
 //
-// It returns the individual errors joined together.
+// Returns:
+//   - nil when every Stop and WaitStopped returned nil.
+//   - errors.Join of every Stop and WaitStopped error otherwise.
+//
+// Notes:
+//   - All Stop calls run before any WaitStopped, so the accept goroutines exit concurrently instead of
+//     one after another.
+//   - An acceptor whose Stop returned an error is not passed to WaitStopped.
 func stopAcceptors(acceptors []*Acceptor) error {
 	waiting := make([]*Acceptor, 0, len(acceptors))
 
 	var stopErrors []error
 	for _, acceptor := range acceptors {
-		if err := acceptor.RequestStop(); err != nil {
+		if err := acceptor.Stop(); err != nil {
 			stopErrors = append(stopErrors, err)
 			continue
 		}
@@ -219,7 +242,7 @@ func stopAcceptors(acceptors []*Acceptor) error {
 	}
 
 	for _, acceptor := range waiting {
-		if err := acceptor.WaitStop(); err != nil {
+		if err := acceptor.WaitStopped(); err != nil {
 			stopErrors = append(stopErrors, err)
 		}
 	}
